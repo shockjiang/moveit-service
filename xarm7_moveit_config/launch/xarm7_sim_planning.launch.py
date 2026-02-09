@@ -66,7 +66,7 @@ def launch_setup(context, *args, **kwargs):
             'add_bio_gripper': 'false',
             'add_realsense_d435i': 'false',
             'add_other_geometry': 'false',
-            'ros2_control_plugin': 'uf_robot_hardware/UFRobotFakeSystemHardware',
+            'ros2_control_plugin': 'mock_components/GenericSystem',
             'attach_to': 'world',
             'attach_xyz': '0 0 0',
             'attach_rpy': '0 0 0',
@@ -199,7 +199,7 @@ def launch_setup(context, *args, **kwargs):
         'octomap_frame': 'world',
         'octomap_resolution': 0.02,
         'ros': {
-            'sensor_plugin': 'occupancy_map_monitor/PointCloudOctomapUpdater',
+            'sensor_plugin': ['occupancy_map_monitor/PointCloudOctomapUpdater'],
             'point_cloud_topic': '/camera/depth/color/points',
             'max_range': 2.0,
             'point_subsample': 1,

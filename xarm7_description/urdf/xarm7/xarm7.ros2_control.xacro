@@ -2,7 +2,7 @@
 <robot xmlns:xacro="http://ros.org/wiki/xacro">
   <xacro:macro name="xarm7_ros2_control" params="prefix
     velocity_control:='false'
-    ros2_control_plugin:='uf_robot_hardware/UFRobotSystemHardware'
+    ros2_control_plugin:='mock_components/GenericSystem'
     hw_ns:='xarm' add_gripper:='false' add_bio_gripper:='false'
     robot_ip:='' report_type:='normal' baud_checkset:='true' default_gripper_baud:=2000000
     joint1_lower_limit:=${-2.0*pi}  joint1_upper_limit:=${2.0*pi}
