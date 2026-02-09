@@ -24,6 +24,8 @@ if(BUILD_TESTING)
 endif()
 
 install(DIRECTORY
+  config
+  meshes
   urdf
   config
   meshes

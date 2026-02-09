@@ -1,0 +1,14 @@
+# 配置文件放置路径xarm_ros2/xarm_moveit_config/config/xarm7
+sensors: ['ros']
+octomap_frame: world
+octomap_resolution: 0.02
+
+ros.sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
+ros.point_cloud_topic: /camera/depth/color/points
+ros.max_range: 2.0
+ros.point_subsample: 1
+ros.padding_offset: 0.1
+ros.padding_scale: 1.0
+ros.max_update_rate: 5.0
+ros.filtered_cloud_topic: /filtered_cloud
+
