@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Repository Overview
-This project aims to implement a xarm7 + bio-gripper path planning with standard ros2 and moveit2. We can create urdf/srdf and MovingGroup from resources under ../libs/xarm_ros2/xarm_description, but we should never rely on package or code of xarm_ros2.
+This project aims to implement a xarm7 + bio-gripper path planning with standard ros2 and moveit2. We can create urdf/srdf and MovingGroup from resources under ../libs/xarm_ros2/xarm7_description, but we should never rely on package or code of xarm_ros2.
 
 Our code should run under the docker container named "sif", which has installed standard jazzy ros2 and moveit packages. Running command: docker exec  sif bash -c "source /opt/ros/jazzy/setup.bash && cd /workspace/moveit; /usr/bin/python3 test_moveit.py" can test it
 

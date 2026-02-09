@@ -40,10 +40,10 @@
     <!-- load params and define property -->
     <xacro:property name="default_inertial_params_filename" value="xarm7_type7_HT_BR2"/>
     <xacro:if value="${inertial_params_filename != ''}">
-      <xacro:property name="link_inertial_params_file" value="$(find xarm_description)/config/link_inertial/${inertial_params_filename}.yaml"/>
+      <xacro:property name="link_inertial_params_file" value="$(find xarm7_description)/config/link_inertial/${inertial_params_filename}.yaml"/>
     </xacro:if>
     <xacro:unless value="${inertial_params_filename != ''}">
-      <xacro:property name="link_inertial_params_file" value="$(find xarm_description)/config/link_inertial/${default_inertial_params_filename}.yaml"/>
+      <xacro:property name="link_inertial_params_file" value="$(find xarm7_description)/config/link_inertial/${default_inertial_params_filename}.yaml"/>
     </xacro:unless>
     <xacro:if value="${use_xacro_load_yaml}">
       <xacro:property name="inertial_params" value="${xacro.load_yaml(link_inertial_params_file)}"/>

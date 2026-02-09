@@ -47,7 +47,7 @@ def launch_setup(context, *args, **kwargs):
     # ROBOT DESCRIPTION (URDF)
     # ==========================================
     xacro_file = os.path.join(
-        get_package_share_directory('xarm_description'),
+        get_package_share_directory('xarm7_description'),
         'urdf', 'xarm_device.urdf.xacro'
     )
     
@@ -78,7 +78,7 @@ def launch_setup(context, *args, **kwargs):
     # ROBOT SEMANTIC DESCRIPTION (SRDF)
     # ==========================================
     srdf_file = os.path.join(
-        get_package_share_directory('xarm_moveit_config'),
+        get_package_share_directory('xarm7_moveit_config'),
         'srdf', 'xarm.srdf.xacro'
     )
     
@@ -329,7 +329,7 @@ def launch_setup(context, *args, **kwargs):
     # NODE 7: RViz2
     # ==========================================
     rviz_config_file = PathJoinSubstitution([
-        FindPackageShare('xarm_moveit_config'),
+        FindPackageShare('xarm7_moveit_config'),
         'rviz',
         'moveit.rviz'
     ])
