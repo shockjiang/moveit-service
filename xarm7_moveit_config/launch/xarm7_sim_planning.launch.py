@@ -27,7 +27,7 @@ def load_yaml_file(package_name, file_path):
         return None
 
 
-def launch_setup(context, *args, **kwargs):
+def launch_setup(context, *_args, **_kwargs):
     
     # ==========================================
     # ROBOT DESCRIPTION (URDF)
@@ -119,35 +119,92 @@ def launch_setup(context, *args, **kwargs):
     # ==========================================
     # PLANNING PIPELINE (OMPL)
     # ==========================================
-    ompl_planning_yaml = {
+    ompl_planning_full = {
         'planning_pipelines': ['ompl'],
-        'default_planning_pipeline': 'ompl',
         'ompl': {
-            'planning_plugin': 'ompl_interface/OMPLPlanner',
-            'request_adapters': 'default_planner_request_adapters/AddTimeOptimalParameterization default_planner_request_adapters/FixWorkspaceBounds default_planner_request_adapters/FixStartStateBounds default_planner_request_adapters/FixStartStateCollision default_planner_request_adapters/FixStartStatePathConstraints',
+            'planning_plugins': ['ompl_interface/OMPLPlanner'],
+            'request_adapters': [
+                'default_planning_request_adapters/ResolveConstraintFrames',
+                'default_planning_request_adapters/ValidateWorkspaceBounds',
+                'default_planning_request_adapters/CheckStartStateBounds',
+                'default_planning_request_adapters/CheckStartStateCollision'
+            ],
+            'response_adapters': [
+                'default_planning_response_adapters/AddTimeOptimalParameterization',
+                'default_planning_response_adapters/ValidateSolution',
+                'default_planning_response_adapters/DisplayMotionPath'
+            ],
             'start_state_max_bounds_error': 0.1,
             'jiggle_fraction': 0.05,
             'projection_evaluator': 'joints(joint1,joint2)',
             'longest_valid_segment_fraction': 0.005,
-        },
-        'RRTConnect': {'type': 'geometric::RRTConnect', 'range': 0.0},
-        'RRT': {'type': 'geometric::RRT', 'range': 0.0, 'goal_bias': 0.05},
-        'RRTstar': {'type': 'geometric::RRTstar', 'range': 0.0, 'goal_bias': 0.05, 'delay_collision_checking': 1},
-        'TRRT': {'type': 'geometric::TRRT', 'range': 0.0, 'goal_bias': 0.05},
-        'PRM': {'type': 'geometric::PRM', 'max_nearest_neighbors': 10},
-        'PRMstar': {'type': 'geometric::PRMstar'},
-        'SBL': {'type': 'geometric::SBL', 'range': 0.0},
-        'EST': {'type': 'geometric::EST', 'range': 0.0, 'goal_bias': 0.05},
-        'LBKPIECE': {'type': 'geometric::LBKPIECE', 'range': 0.0, 'border_fraction': 0.9, 'min_valid_path_fraction': 0.5},
-        'BKPIECE': {'type': 'geometric::BKPIECE', 'range': 0.0, 'border_fraction': 0.9, 'failed_expansion_score_factor': 0.5, 'min_valid_path_fraction': 0.5},
-        'KPIECE': {'type': 'geometric::KPIECE', 'range': 0.0, 'goal_bias': 0.05, 'border_fraction': 0.9, 'failed_expansion_score_factor': 0.5, 'min_valid_path_fraction': 0.5},
-        'xarm7': {
-            'default_planner_config': 'RRTConnect',
-            'planner_configs': ['SBL', 'EST', 'LBKPIECE', 'BKPIECE', 'KPIECE', 'RRT', 'RRTConnect', 'RRTstar', 'TRRT', 'PRM', 'PRMstar'],
-        },
-        'xarm_gripper': {
-            'default_planner_config': 'RRTConnect',
-            'planner_configs': ['RRTConnect', 'RRT'],
+            'planner_configs': {
+                'RRTConnect': {
+                    'type': 'geometric::RRTConnect',
+                    'range': 0.0
+                },
+                'RRT': {
+                    'type': 'geometric::RRT',
+                    'range': 0.0,
+                    'goal_bias': 0.05
+                },
+                'RRTstar': {
+                    'type': 'geometric::RRTstar',
+                    'range': 0.0,
+                    'goal_bias': 0.05,
+                    'delay_collision_checking': 1
+                },
+                'TRRT': {
+                    'type': 'geometric::TRRT',
+                    'range': 0.0,
+                    'goal_bias': 0.05
+                },
+                'PRM': {
+                    'type': 'geometric::PRM',
+                    'max_nearest_neighbors': 10
+                },
+                'PRMstar': {
+                    'type': 'geometric::PRMstar'
+                },
+                'SBL': {
+                    'type': 'geometric::SBL',
+                    'range': 0.0
+                },
+                'EST': {
+                    'type': 'geometric::EST',
+                    'range': 0.0,
+                    'goal_bias': 0.05
+                },
+                'LBKPIECE': {
+                    'type': 'geometric::LBKPIECE',
+                    'range': 0.0,
+                    'border_fraction': 0.9,
+                    'min_valid_path_fraction': 0.5
+                },
+                'BKPIECE': {
+                    'type': 'geometric::BKPIECE',
+                    'range': 0.0,
+                    'border_fraction': 0.9,
+                    'failed_expansion_score_factor': 0.5,
+                    'min_valid_path_fraction': 0.5
+                },
+                'KPIECE': {
+                    'type': 'geometric::KPIECE',
+                    'range': 0.0,
+                    'goal_bias': 0.05,
+                    'border_fraction': 0.9,
+                    'failed_expansion_score_factor': 0.5,
+                    'min_valid_path_fraction': 0.5
+                }
+            },
+            'xarm7': {
+                'default_planner_config': 'RRTConnect',
+                'planner_configs': ['SBL', 'EST', 'LBKPIECE', 'BKPIECE', 'KPIECE', 'RRT', 'RRTConnect', 'RRTstar', 'TRRT', 'PRM', 'PRMstar']
+            },
+            'xarm_gripper': {
+                'default_planner_config': 'RRTConnect',
+                'planner_configs': ['RRTConnect', 'RRT']
+            }
         }
     }
 
@@ -253,7 +310,7 @@ def launch_setup(context, *args, **kwargs):
         executable='static_transform_publisher',
         name='world_to_base_broadcaster',
         output='screen',
-        arguments=['0', '0', '0', '0', '0', '0', 'world', 'link_base'],
+        arguments=['--x', '0', '--y', '0', '--z', '0', '--roll', '0', '--pitch', '0', '--yaw', '0', '--frame-id', 'world', '--child-frame-id', 'link_base'],
     )
 
     # ROS2 Control
@@ -310,7 +367,7 @@ def launch_setup(context, *args, **kwargs):
             robot_description_semantic,
             kinematics_yaml,
             joint_limits_yaml,
-            ompl_planning_yaml,
+            ompl_planning_full,
             trajectory_execution,
             planning_scene_monitor,
             sensors_3d_yaml,
@@ -324,7 +381,7 @@ def launch_setup(context, *args, **kwargs):
         'rviz',
         'moveit.rviz'
     ])
-    
+
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
@@ -335,7 +392,7 @@ def launch_setup(context, *args, **kwargs):
             robot_description,
             robot_description_semantic,
             kinematics_yaml,
-            ompl_planning_yaml,
+            ompl_planning_full,
             joint_limits_yaml,
             planning_scene_monitor,
         ],
@@ -348,7 +405,7 @@ def launch_setup(context, *args, **kwargs):
             on_exit=[EmitEvent(event=Shutdown())]
         )
     )
-    
+
     return [
         rviz_exit_handler,
         robot_state_publisher,
