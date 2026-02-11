@@ -1119,9 +1119,9 @@ def main():
     pixel_to_meter = 0.0001
     place_clearance = -0.02
     
-    with open("camera_config.json", 'r') as f:
-        camera_params = json.load(f)
-    executor = XArmGraspExecutor(execution_mode=EXECUTION_MODE,camera_params=camera_params)
+    with open("config/xarm7_config.json", 'r') as f:
+        config = json.load(f)
+    executor = XArmGraspExecutor(execution_mode=EXECUTION_MODE,camera_params=config["camera"])
     executor.pregrasp_offset = PREGRASP_OFFSET
     executor.current_joint_state = home_joints  # 初始化关节状态
 
