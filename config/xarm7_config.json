@@ -1,0 +1,70 @@
+{
+    "camera": {
+        "intrinsics": {
+            "fx": 909.6648559570312,
+            "fy": 909.5330200195312,
+            "cx": 636.739013671875,
+            "cy": 376.3500061035156
+        },
+        "extrinsics": {
+            "translation": [0.32508802, 0.02826776, 0.65804681],
+            "quaternion": [-0.70315987, 0.71022054, -0.02642658, 0.02132171]
+        },
+        "depth_scale": 0.001,
+        "max_range_m": 3.0,
+        "min_range_m": 0.02
+    },
+    
+    "robot": {
+        "planning_group": "xarm7",
+        "base_frame": "link_base",
+        "tcp_link": "link_tcp",
+        "gripper_link": "link_tcp"
+    },
+    
+    "gripper": {
+        "width_max": 0.085,
+        "joint_max": 0.085,
+        "touch_links": [
+            "link_tcp",
+            "xarm_gripper_base_link",
+            "left_outer_knuckle",
+            "left_finger",
+            "right_outer_knuckle",
+            "right_finger"
+        ]
+    },
+    
+    "grasp": {
+        "pregrasp_offset": 0.10,
+        "pregrasp_approach_axis": [0.0, 0.0, -1.0],
+        "extra_open": 0.020,
+        "pixel_to_meter": 0.0001
+    },
+    
+    "workspace_limits": {
+        "x": [-0.5, 0.7],
+        "y": [-0.8, 0.8],
+        "z": [0.0, 0.8]
+    },
+    
+    "basket": {
+        "default_id": "basket_1",
+        "center": [0.4, 0.3, 0.1],
+        "outer_size": [0.3, 0.2, 0.15],
+        "wall_thickness": 0.005,
+        "bottom_thickness": 0.005,
+        "rpy": [0.0, 0.0, 0.0]
+    },
+    
+    "scene_manager": {
+        "frame_id": "link_base",
+        "stride": 1,
+        "score_thresh": 0.3
+    },
+    
+    "execution": {
+        "mode": true,
+        "use_pregrasp": true
+    }
+}

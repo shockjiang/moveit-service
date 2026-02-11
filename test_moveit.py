@@ -128,21 +128,25 @@ class XArmGraspExecutor(Node):
         """相机坐标系转基座坐标系"""
         h, w = depth_img.shape
         u_int, v_int = int(round(u)), int(round(v))
-        
+
         if not (0 <= u_int < w and 0 <= v_int < h):
             return None
-        
-        z = depth_img[v_int, u_int] * self.camera_params["depth_scale"]
-        
+
+        # 从嵌套的intrinsics字典中获取参数
+        intrinsics = self.camera_params.get("intrinsics", self.camera_params)
+        depth_scale = self.camera_params.get("depth_scale", 0.001)
+
+        z = depth_img[v_int, u_int] * depth_scale
+
         if z <= 0 or not np.isfinite(z):
             return None
-        
-        x = (u - self.camera_params["cx"]) * z / self.camera_params["fx"]
-        y = (v - self.camera_params["cy"]) * z / self.camera_params["fy"]
+
+        x = (u - intrinsics["cx"]) * z / intrinsics["fx"]
+        y = (v - intrinsics["cy"]) * z / intrinsics["fy"]
         point_cam = [x, y, z]
         pt = np.array(point_cam, dtype=np.float64).reshape(3)
         pt_base = (pt @ self.scene_manager.R_cam2base.T) + self.scene_manager.t_cam2base
-        
+
         return tuple(pt_base.astype(float))
 
     def parse_affordances_to_candidates(
@@ -1095,9 +1099,9 @@ def main():
     PREGRASP_OFFSET = 0.20
     
     # 文件路径
-    depth_path = "/home/bb/下载/3DGrasp-BMv1/grasp-wrist-dpt_opt.png"
-    seg_json_path = "/home/bb/桌面/rgb检测分割结果wrist"
-    affordance_path = "/home/bb/桌面/affordance"
+    depth_path = "test_data/grasp-wrist-dpt_opt.png"
+    seg_json_path = "test_data/rgb检测分割结果wrist"
+    affordance_path = "test_data/affordance"
     
     # Home点位姿
     home_pose = ([0.270, 0.0, 0.307], (-np.pi, 0.0, 0.0))
@@ -1124,13 +1128,15 @@ def main():
     try:
         # ========== Step 1: 移到home点 ==========
         executor.get_logger().info("=== Step 1: Moving to HOME ===")
-        if EXECUTION_MODE:
-            executor.plan_to_pose(
-                xyz=home_pose[0],rpy=home_pose[1],
-                drive_joint_rad=executor.gripper_joint_max,
-                start_joint_state=None,
-                planner_id="RRTConnect",
-                plan_only = not EXECUTION_MODE)
+        home_result = executor.plan_to_pose(
+            xyz=home_pose[0],
+            rpy=home_pose[1],
+            drive_joint_rad=executor.gripper_joint_max,
+            start_joint_state=None,
+            planner_id="RRTConnect",
+            plan_only=not EXECUTION_MODE,    )
+        _,home_final_state = home_result
+        executor.current_joint_state = home_final_state
 
         # ========== Step 2: 添加workspace限制 ==========
         executor.get_logger().info("=== Step 2: Adding workspace constraints ===")
