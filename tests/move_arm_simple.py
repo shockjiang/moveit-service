@@ -294,7 +294,7 @@ class MoveArmClient(Node):
         self.get_logger().info('Waiting for action server...')
         self._action_client.wait_for_server()
 
-        self.get_logger().info(f'Sending pose goal: x={x}, y={y}, z={z}')
+        self.get_logger().info(f'Sending pose goal: {end_pos}')
         send_goal_future = self._action_client.send_goal_async(goal_msg)
         rclpy.spin_until_future_complete(self, send_goal_future, timeout_sec=self.timeout_sec)
 
@@ -487,7 +487,7 @@ def main():
         else:
             print(f"  {name}: FK computation timed out")
 
-    if 0:
+    if 1:
         # Convert home position from degrees to radians
         home_joints = home["joints"]
         target_joints = target["joints"]

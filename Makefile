@@ -14,7 +14,9 @@ build:
 
 run: # must be run with rviz
 	source set-env.sh
-	xvfb-run ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false 2 > log/moveit.log & tail -f log/moveit.log
+	ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false
+
+# 	xvfb-run ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false 2 > log/moveit.log & tail -f log/moveit.log
 
 run-vis:
 	source set-env.sh
@@ -28,18 +30,20 @@ test:
 status:
 	source set-env.sh
 	ros2 node list
-
+	ps aux|grep ros
 
 clean:
 	rm -fr install log build
 
 
 stop-all:
-	-pkill -9 -f ros2
-	-pkill -9 -f ros
-	-pkill -9 -f _ros2_daemon
-	-pkill -9 -f /opt/ros/
-	-pkill -9 Xvfb
+	pkill -9 -f ros2
+	pkill -9 -f ros
+	pkill -9 -f _ros2_daemon
+	pkill -9 -f /opt/ros/
+	pkill -9 -f /move_group
+	pkill -9 Xvfb
+	
 
 start-all:
 	source set-env.sh

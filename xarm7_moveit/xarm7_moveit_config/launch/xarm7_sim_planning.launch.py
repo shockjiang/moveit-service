@@ -29,7 +29,8 @@ def load_yaml_file(package_name, file_path):
 
 def launch_setup(context, *_args, **_kwargs):
     # Get launch argument
-    use_rviz = LaunchConfiguration('use_rviz').perform(context) == 'true'
+    use_rviz_str = LaunchConfiguration('use_rviz').perform(context).lower()
+    use_rviz = use_rviz_str in ['true', '1', 'yes']
     
     # ==========================================
     # ROBOT DESCRIPTION (URDF)
