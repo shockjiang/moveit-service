@@ -5,11 +5,11 @@
 import os
 from ament_index_python import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import OpaqueFunction, RegisterEventHandler, EmitEvent, TimerAction
+from launch.actions import OpaqueFunction, RegisterEventHandler, EmitEvent, TimerAction, DeclareLaunchArgument
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch_ros.actions import Node
-from launch.substitutions import PathJoinSubstitution
+from launch.substitutions import PathJoinSubstitution, LaunchConfiguration
 from launch_ros.substitutions import FindPackageShare
 import xacro
 import yaml
@@ -28,6 +28,8 @@ def load_yaml_file(package_name, file_path):
 
 
 def launch_setup(context, *_args, **_kwargs):
+    # Get launch argument
+    use_rviz = LaunchConfiguration('use_rviz').perform(context) == 'true'
     
     # ==========================================
     # ROBOT DESCRIPTION (URDF)
@@ -398,7 +400,7 @@ def launch_setup(context, *_args, **_kwargs):
         ],
     )
 
-    # Shutdown on RViz exit
+    # Shutdown on RViz exit (only if RViz is enabled)
     rviz_exit_handler = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=rviz_node,
@@ -406,8 +408,8 @@ def launch_setup(context, *_args, **_kwargs):
         )
     )
 
-    return [
-        rviz_exit_handler,
+    # Build node list
+    nodes = [
         robot_state_publisher,
         static_tf_node,
         ros2_control_node,
@@ -415,11 +417,22 @@ def launch_setup(context, *_args, **_kwargs):
         delayed_arm_controller,
         delayed_gripper_controller,
         move_group_node,
-        rviz_node,
     ]
+
+    # Add RViz nodes only if use_rviz is True
+    if use_rviz:
+        nodes.insert(0, rviz_exit_handler)
+        nodes.append(rviz_node)
+
+    return nodes
 
 
 def generate_launch_description():
     return LaunchDescription([
+        DeclareLaunchArgument(
+            'use_rviz',
+            default_value='true',
+            description='Whether to start RViz'
+        ),
         OpaqueFunction(function=launch_setup)
     ])

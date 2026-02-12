@@ -12,10 +12,13 @@ build:
 	source set-env.sh
 	colcon build
 
-run:
+run: # must be run with rviz
 	source set-env.sh
-	ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py
+	xvfb-run ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false 2 > log/moveit.log & tail -f log/moveit.log
 
+run-vis:
+	source set-env.sh
+	ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py 
 
 test:
 	source set-env.sh
@@ -29,5 +32,17 @@ status:
 
 clean:
 	rm -fr install log build
+
+
+stop-all:
+	-pkill -9 -f ros2
+	-pkill -9 -f ros
+	-pkill -9 -f _ros2_daemon
+	-pkill -9 -f /opt/ros/
+	-pkill -9 Xvfb
+
+start-all:
+	source set-env.sh
+	ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py
 
 .PHONY: set-env exec build run test status clean

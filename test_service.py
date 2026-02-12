@@ -31,8 +31,8 @@ def test_grasp():
         "robot_name": "xarm7",
         "target_object_index": 0,
         "depth_path": "test_data/grasp-wrist-dpt_opt.png",
-        "seg_json_path": "test_data/rgb检测分割结果wrist",
-        "affordance_path": "test_data/affordance"
+        "seg_json_path": "test_data/rgb_detection_wrist.json",
+        "affordance_path": "test_data/affordance.json"
     }
 
     print(f"请求数据: {json.dumps(data, indent=2, ensure_ascii=False)}")

@@ -73,7 +73,8 @@ class MoveArmClient(Node):
             goal_msg.request.start_state = start_state
             self.get_logger().info(f'Using custom start state: {[f"{math.degrees(j):.1f}°" for j in start_pos]}')
 
-        # Set joint constraints
+        # Set joint constraints (all joints must be satisfied together)
+        constraints = Constraints()
         for name, value in zip(self.joint_names, joint_values):
             constraint = JointConstraint()
             constraint.joint_name = name
@@ -81,7 +82,8 @@ class MoveArmClient(Node):
             constraint.tolerance_above = 0.01
             constraint.tolerance_below = 0.01
             constraint.weight = 1.0
-            goal_msg.request.goal_constraints.append(Constraints(joint_constraints=[constraint]))
+            constraints.joint_constraints.append(constraint)
+        goal_msg.request.goal_constraints.append(constraints)
 
         self.get_logger().info('Waiting for action server...')
         self._action_client.wait_for_server()
@@ -212,15 +214,22 @@ class MoveArmClient(Node):
         return traj_dict
 
 
-    def send_pose_goal(self, x, y, z, qx=0.0, qy=0.0, qz=0.0, qw=1.0, plan_only=False, start_pos=None):
+    def send_pose_goal(self, end_pos, plan_only=False, start_pos=None):
         """Move to specific end-effector pose
 
         Args:
-            x, y, z: Target position in meters
-            qx, qy, qz, qw: Target orientation as quaternion
+            x, y, z: Target position in meters (optional if end_pos is provided)
+            qx, qy, qz, qw: Target orientation as quaternion (optional if end_pos is provided)
             plan_only: If True, only plan without executing
             start_pos: Optional list of 7 joint angles in radians as start state
+            end_pos: Optional dict with 'position' [x,y,z] and 'orientation' [qx,qy,qz,qw]
         """
+        x, y, z = end_pos['position']
+        qx, qy, qz, qw = end_pos['orientation']
+        # Validate that we have position
+        if x is None or y is None or z is None:
+            self.get_logger().error('Position (x, y, z) must be provided either directly or via end_pos')
+            return False
         goal_msg = MoveGroup.Goal()
         goal_msg.request.group_name = "xarm7"
         goal_msg.request.num_planning_attempts = 10
@@ -329,13 +338,32 @@ def main():
     # Load home position from config
 
     home = {
-        "position": [0.270, 0.0, 0.307],
-        "orientation": [-3.14159, 0.0, 0.0],
-        "joints": [0.1, -41.1, -0.6, 45.2, 0.7, 86.3, 0.6]
+        "end_effector": {
+            "position": [0.270, 0.0, 0.307],
+            "orientation": [-3.14159, 0.0, 0.0],
+        },
+        # "joints": [0.00175, -0.71728, -0.01047, 0.78900, 0.01222, 1.50631, 0.01047]
+        # "joints": [0.001745, -0.717278, -0.010472, 0.789003, 0.012217, 1.506311, 0.010472]
+        "joints": [-0.000, -0.638, 0.000, 0.332, 0.000, 0.970, -0.000]
     }
-    
 
-    if home.get('joints') is None:
+    target = {
+        "joints": [
+          1.6622234460021021,
+          1.2401318323092207,
+          -1.7764093688457474,
+          0.9979773983738144,
+          1.2252734989481147,
+          -1.485025259766139,
+          -2.5484964788645064
+        ],
+        "end_effector": {
+            "position": [0.3005336978498776, 0.20005642529744397, 0.5008136122083992],
+            "orientation": [0.04380878657316783, 0.031363280885389304, 0.04066292615045238, 0.9977192296773548]
+        }
+    } 
+
+    for point3d in [home, target]:
         # calculate home joint angles using IK if only position/orientation is provided
         print("Calculating home joint angles using IK...")
 
@@ -345,9 +373,17 @@ def main():
             return
 
         # Convert orientation from euler angles (roll, pitch, yaw) to quaternion
-        from scipy.spatial.transform import Rotation
-        euler = home['orientation']  # [roll, pitch, yaw] in radians
-        quat = Rotation.from_euler('xyz', euler).as_quat()  # [x, y, z, w]
+        
+        if len(point3d['end_effector']['orientation']) == 3:
+            euler = home['end_effector']['orientation']  # [roll, pitch, yaw] in radians
+            from scipy.spatial.transform import Rotation
+            quat = Rotation.from_euler('xyz', euler).as_quat()  # [x, y, z, w]
+        elif len(point3d['end_effector']['orientation']) == 4:
+            quat = point3d['end_effector']['orientation']  # Already in quaternion format
+        else:
+            raise NotImplementedError("Orientation must be either 3 (euler) or 4 (quaternion) values")
+        
+        # breakpoint()
 
         # Prepare IK request
         ik_request = GetPositionIK.Request()
@@ -355,11 +391,14 @@ def main():
         ik_request.ik_request.avoid_collisions = True
         ik_request.ik_request.timeout.sec = 5
 
+        # Set the link name for which to compute IK
+        ik_request.ik_request.ik_link_name = "link_eef"
+
         # Set target pose
         ik_request.ik_request.pose_stamped.header.frame_id = "link_base"
-        ik_request.ik_request.pose_stamped.pose.position.x = home['position'][0]
-        ik_request.ik_request.pose_stamped.pose.position.y = home['position'][1]
-        ik_request.ik_request.pose_stamped.pose.position.z = home['position'][2]
+        ik_request.ik_request.pose_stamped.pose.position.x = point3d['end_effector']['position'][0]
+        ik_request.ik_request.pose_stamped.pose.position.y =  point3d['end_effector']['position'][1]
+        ik_request.ik_request.pose_stamped.pose.position.z =  point3d['end_effector']['position'][2]
         ik_request.ik_request.pose_stamped.pose.orientation.x = quat[0]
         ik_request.ik_request.pose_stamped.pose.orientation.y = quat[1]
         ik_request.ik_request.pose_stamped.pose.orientation.z = quat[2]
@@ -373,8 +412,11 @@ def main():
             result = future.result()
             if result.error_code.val == 1:  # SUCCESS
                 joint_positions = result.solution.joint_state.position
-                home['joints'] = [math.degrees(j) for j in joint_positions]
-                print(f"✓ IK solved: {[f'{j:.1f}°' for j in home['joints']]}")
+                # point3d['joints'] = joint_positions
+                joints_deg = [math.degrees(j) for j in joint_positions]
+                print(f"✓ IK solved deg: {[f'{j:.1f}' for j in joints_deg]}")
+                print(f"✓ IK solved rad: {[f'{j:.3f}' for j in joint_positions]}")
+                print(f'original  joint: {point3d["joints"]}')
             else:
                 print(f"✗ IK failed with error code: {result.error_code.val}")
                 return
@@ -382,27 +424,92 @@ def main():
             print("✗ IK computation timed out and exit")
             return
 
-    # Convert home position from degrees to radians
-    home_joints = [math.radians(j) for j in home['joints']]
-    print(f"Home position: {[f'{math.degrees(j):.1f}°' for j in home_joints]}")
+    # Verify IK solution by computing FK and comparing with original end-effector pose
+    print("\nVerifying IK solutions...")
+    for name, point3d in [("home", home), ("target", target)]:
+        # Prepare FK request
+        fk_request = GetPositionFK.Request()
+        fk_request.header.frame_id = 'link_base'
+        fk_request.fk_link_names = ['link_eef']
 
-    # Example 1: Move to joint positions with home as start state
-    print("\nMoving to zero position from home...")
-    joint_values = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    success = client.send_joint_goal(joint_values, plan_only=True, start_pos=home_joints)
+        joint_state = JointState()
+        joint_state.name = client.joint_names
+        joint_state.position = list(point3d['joints'])
+        fk_request.robot_state.joint_state = joint_state
 
-    if success:
-        print("✓ Movement succeeded!")
-    else:
-        print("✗ Movement failed!")
+        # Call FK service
+        future = client._fk_client.call_async(fk_request)
+        rclpy.spin_until_future_complete(client, future, timeout_sec=2.0)
 
-    # Example 2: Move to a pose with home as start state (uncomment to test)
-    print("\nMoving to target pose from home...")
-    success = client.send_pose_goal(x=0.3, y=0.2, z=0.5, plan_only=True, start_pos=home_joints)
-    if success:
-        print("✓ Movement succeeded!")
-    else:
-        print("✗ Movement failed!")
+        if future.done():
+            result = future.result()
+            if result.error_code.val == 1:  # SUCCESS
+                pose = result.pose_stamped[0].pose
+
+                # Compare with original end-effector pose
+                original_pos = point3d['end_effector']['position']
+                calculated_pos = [pose.position.x, pose.position.y, pose.position.z]
+
+                pos_diff = [abs(o - c) for o, c in zip(original_pos, calculated_pos)]
+                max_pos_error = max(pos_diff)
+
+                # Compare quaternion orientation
+                # Convert original orientation to quaternion if needed
+                if len(point3d['end_effector']['orientation']) == 3:
+                    from scipy.spatial.transform import Rotation
+                    original_quat = Rotation.from_euler('xyz', point3d['end_effector']['orientation']).as_quat()
+                else:
+                    original_quat = point3d['end_effector']['orientation']
+
+                calculated_quat = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+
+                # Calculate quaternion distance (angular error)
+                # Use dot product: angle = 2 * arccos(|q1 · q2|)
+                dot_product = sum(o * c for o, c in zip(original_quat, calculated_quat))
+                angular_error = 2 * math.acos(min(abs(dot_product), 1.0))  # Clamp to avoid numerical issues
+                angular_error_deg = math.degrees(angular_error)
+
+                print(f"  {name}: pos_error={max_pos_error:.6f}m, orient_error={angular_error_deg:.3f}°", end="")
+                if max_pos_error < 0.001 and angular_error_deg < 1.0:  # 1mm and 1 degree tolerance
+                    print(" ✓")
+                else:
+                    print(f" ✗")
+                    if max_pos_error >= 0.001:
+                        print(f"    Position exceeds 1mm tolerance:")
+                        print(f"      Original: {[f'{p:.4f}' for p in original_pos]}")
+                        print(f"      Calculated: {[f'{p:.4f}' for p in calculated_pos]}")
+                    if angular_error_deg >= 1.0:
+                        print(f"    Orientation exceeds 1° tolerance:")
+                        print(f"      Original quat: {[f'{q:.4f}' for q in original_quat]}")
+                        print(f"      Calculated quat: {[f'{q:.4f}' for q in calculated_quat]}")
+            else:
+                print(f"  {name}: FK failed with error code {result.error_code.val}")
+        else:
+            print(f"  {name}: FK computation timed out")
+
+    if 0:
+        # Convert home position from degrees to radians
+        home_joints = home["joints"]
+        target_joints = target["joints"]
+        print(f"Home position: {[f'{math.degrees(j):.1f}°' for j in home_joints]}")
+        print(f'target position: {[f"{math.degrees(j):.1f}°" for j in target_joints]}')
+
+        # Example 1: Move to joint positions with home as start state
+        print("\nMoving to zero position from home...")
+        success = client.send_joint_goal(target_joints, plan_only=True, start_pos=home_joints)
+
+        if success:
+            print("✓ Movement succeeded!")
+        else:
+            print("✗ Movement failed!")
+
+        # Example 2: Move to a pose with home as start state (uncomment to test)
+        print("\nMoving to target pose from home...")
+        success = client.send_pose_goal(end_pos=target["end_effector"], plan_only=True, start_pos=home_joints)
+        if success:
+            print("✓ Movement succeeded!")
+        else:
+            print("✗ Movement failed!")
 
     client.destroy_node()
     rclpy.shutdown()

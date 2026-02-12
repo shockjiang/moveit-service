@@ -202,21 +202,31 @@ class SceneManager:
         for inst, m in zip(self.instances, full_masks):
             inst_id = inst["id"]
             if inst_id in self.disabled_instance_ids:
+                self.node.get_logger().info(f"[FILTER] {inst_id}: disabled")
                 continue
 
             m_u8 = m.astype(np.uint8)
             m_eroded = cv2.erode(m_u8, kernel, iterations=1).astype(bool)
 
             pts_obj = self._build_points(z_m, m_eroded)
+            pts_before_filter = pts_obj.shape[0]
+
             # 滤掉base点（减少凸包底部发散）
             if base_z is not None and table_filter_margin is not None and pts_obj.shape[0] > 0:
                 pts_obj = pts_obj[pts_obj[:, 2] > (base_z + table_filter_margin)]
 
+            pts_after_filter = pts_obj.shape[0]
+            self.node.get_logger().info(
+                f"[MESH] {inst_id}: points before={pts_before_filter}, after_filter={pts_after_filter}, base_z={base_z:.3f if base_z else 'None'}"
+            )
+
             mesh = self._mesh_from_convex_hull(pts_obj)
             if mesh is None:
+                self.node.get_logger().warn(f"[FILTER] {inst_id}: mesh generation failed (pts={pts_after_filter})")
                 continue
             meshes.append((inst_id, mesh))
             self.processed_meshes[inst_id] = mesh
+            self.node.get_logger().info(f"[SUCCESS] {inst_id}: mesh created with {len(mesh.vertices)} vertices")
 
         # 8. Apply 碰撞场景（凸包先上场景）
         if meshes:
