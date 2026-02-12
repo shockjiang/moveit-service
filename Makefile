@@ -13,3 +13,4 @@ run:
 
 clean:
 	rm -fr install log build
+

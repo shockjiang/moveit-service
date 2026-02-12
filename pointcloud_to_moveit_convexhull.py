@@ -74,65 +74,92 @@ def pose_identity() -> Pose:
     p.orientation.w = 1.0
     return p
 
-class SceneManager(Node):
-    def __init__(self,frame_id: str,fx: float, fy: float, cx: float, cy: float,t_cam2base: np.ndarray,q_cam2base: np.ndarray,depth_scale: float = 0.001,max_range_m: float = 3.0,min_range_m: float = 0.02,stride: int = 1,score_thresh: float = 0.3,):
-        super().__init__("scene_manager")
-        # 相机参数
-        self.frame_id = frame_id
-        self.fx = float(fx)
-        self.fy = float(fy)
-        self.cx = float(cx)
-        self.cy = float(cy)
-        self.depth_scale = float(depth_scale)
-        self.max_range_m = float(max_range_m)
-        self.min_range_m = float(min_range_m)
-        self.stride = int(stride)
-        self.score_thresh = float(score_thresh)
+class SceneManager:
+    def __init__(self, node: Node, config: dict = None, **kwargs):
+        """
+        Args:
+            node: 父ROS2节点
+            config: 完整配置字典（优先使用）
+            **kwargs: 传统参数方式（向后兼容）
+        """
+        self.node = node
 
-        # 相机到基座的变换
-        self.t_cam2base = np.asarray(t_cam2base, dtype=np.float64).reshape(3)
-        self.q_cam2base = np.asarray(q_cam2base, dtype=np.float64).reshape(4)
+        # 从config或kwargs读取参数
+        if config is not None:
+            cam = config["camera"]
+            intrinsics = cam["intrinsics"]
+            extrinsics = cam["extrinsics"]
+            scene_cfg = config["scene_manager"]
+            robot_cfg = config["robot"]
+
+            self.frame_id = robot_cfg["base_frame"]
+            self.fx = float(intrinsics["fx"])
+            self.fy = float(intrinsics["fy"])
+            self.cx = float(intrinsics["cx"])
+            self.cy = float(intrinsics["cy"])
+            self.depth_scale = float(cam["depth_scale"])
+            self.max_range_m = float(cam["max_range_m"])
+            self.min_range_m = float(cam["min_range_m"])
+            self.stride = int(scene_cfg["stride"])
+            self.score_thresh = float(scene_cfg["score_thresh"])
+            self.t_cam2base = np.array(extrinsics["translation"], dtype=np.float64).reshape(3)
+            self.q_cam2base = np.array(extrinsics["quaternion"], dtype=np.float64).reshape(4)
+        else:
+            # 向后兼容：从kwargs读取
+            self.frame_id = kwargs.get("frame_id", "link_base")
+            self.fx = float(kwargs.get("fx"))
+            self.fy = float(kwargs.get("fy"))
+            self.cx = float(kwargs.get("cx"))
+            self.cy = float(kwargs.get("cy"))
+            self.depth_scale = float(kwargs.get("depth_scale", 0.001))
+            self.max_range_m = float(kwargs.get("max_range_m", 3.0))
+            self.min_range_m = float(kwargs.get("min_range_m", 0.02))
+            self.stride = int(kwargs.get("stride", 1))
+            self.score_thresh = float(kwargs.get("score_thresh", 0.3))
+            self.t_cam2base = np.asarray(kwargs.get("t_cam2base"), dtype=np.float64).reshape(3)
+            self.q_cam2base = np.asarray(kwargs.get("q_cam2base"), dtype=np.float64).reshape(4)
+
         self.R_cam2base = R.from_quat(self.q_cam2base).as_matrix()
 
         # 实例管理
-        # TODO：确定几个
-        self.instances = []  # 当前分割实例列表
-        self.disabled_instance_ids = set()  # 被移除物品的
+        self.instances = []
+        self.disabled_instance_ids = set()
         self.processed_meshes: dict[str, Mesh] = {}
         self.last_table_z: float | None = None
 
         # ROS2 发布器
-        cloud_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST,depth=1,reliability=ReliabilityPolicy. RELIABLE,durability=DurabilityPolicy.VOLATILE,)
+        cloud_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.topic = "/camera/depth/color/points"
-        self.pub = self.create_publisher(PointCloud2, self.topic, cloud_qos)
+        self.pub = self.node.create_publisher(PointCloud2, self.topic, cloud_qos)
 
         # ROS2 服务客户端
-        self._clear_cli = self.create_client(Empty, "/clear_octomap")
-        self._apply_scene_cli = self.create_client(ApplyPlanningScene, "/apply_planning_scene")
-
-        self.get_logger().info(f"SceneManager initialized: frame={self.frame_id}, "f"topic={self.topic}, stride={self.stride}")
+        self._clear_cli = self.node.create_client(Empty, "/clear_octomap")
+        self._apply_scene_cli = self.node.create_client(ApplyPlanningScene, "/apply_planning_scene")
 
     def update_scene(self, depth_path: str, seg_json_path: str):
-        self.get_logger().info(f"Updating scene: depth={depth_path}, seg={seg_json_path}")
-
         # 1. 清除OctoMap
         if self._clear_cli.wait_for_service(timeout_sec=2.0):
             try:
                 self._clear_cli.call_async(Empty.Request())
             except Exception as e:
-                self.get_logger().error(f"Failed to clear OctoMap: {e}")
+                self.node.get_logger().error(f"Failed to clear OctoMap: {e}")
         else:
-            self.get_logger().warn("/clear_octomap service not available")
+            self.node.get_logger().warn("/clear_octomap service not available")
 
         # 2. 加载分割实例
         self.instances = self._load_instances(seg_json_path, self.score_thresh)
         if not self.instances:
-            self.get_logger().warn("No instances loaded from segmentation")
+            self.node.get_logger().warn("No instances loaded from segmentation")
 
         # 3. 读取深度图
         depth_img = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
         if depth_img is None:
-            self.get_logger().error(f"Failed to read depth image: {depth_path}")
+            self.node.get_logger().error(f"Failed to read depth image: {depth_path}")
             return
         z_m = depth_img.astype(np.float32) * self.depth_scale
 
@@ -148,23 +175,24 @@ class SceneManager(Node):
         if full_masks:
             union_mask = np.logical_or.reduce(full_masks)
             bg_mask = ~union_mask
+            coverage_ratio = union_mask.sum() / union_mask.size
+            # self.node.get_logger().info(f"Object mask coverage: {coverage_ratio*100:.1f}%")
         else:
             bg_mask = np.ones_like(z_m, dtype=bool)
         pts_bg = self._build_points(z_m, bg_mask)
+        # self.node.get_logger().info(f"Background points generated: {pts_bg.shape[0]}")
 
         # 6. 估计背景z
         base_z = None
         try:
             base_z = self._estimate_base_z_from_bg(pts_bg)
         except Exception as e:
-            self.get_logger().warn(f"Base z estimation failed: {e}")
+            self.node.get_logger().warn(f"Base z estimation failed: {e}")
 
         if base_z is not None:
-            table_filter_margin = 0.01  
-            # self.get_logger().info(f"Estimated base_z={base_z:.4f} m, filter_margin={table_filter_margin:.3f} m")
+            table_filter_margin = 0.01
         else:
             table_filter_margin = None
-            self.get_logger().warn("No base_z estimated; will skip base-point filtering")
 
         # 7. 先为每个启用的实例生成凸包
         k = 7 if self.stride <= 2 else 5
@@ -186,7 +214,6 @@ class SceneManager(Node):
 
             mesh = self._mesh_from_convex_hull(pts_obj)
             if mesh is None:
-                self.get_logger().warn(f"Failed to create hull for {inst_id}")
                 continue
             meshes.append((inst_id, mesh))
             self.processed_meshes[inst_id] = mesh
@@ -194,27 +221,28 @@ class SceneManager(Node):
         # 8. Apply 碰撞场景（凸包先上场景）
         if meshes:
             if not self._apply_scene_cli.wait_for_service(timeout_sec=2.0):
-                self.get_logger().warn("/apply_planning_scene not ready; skip applying meshes")
+                self.node.get_logger().warn("/apply_planning_scene not ready")
             else:
                 self._apply_collision_meshes(meshes)
-            self.get_logger().info(f"Applied {len(meshes)} collision meshes")
-        else:
-            self.get_logger().info("No meshes to apply")
+                self.node.get_logger().info(f"Applied {len(meshes)} collision meshes")
 
         # 9. 发布背景点云给 OctoMap
-        for _ in range(10):
-            self._publish_pointcloud(pts_bg)
-            rclpy.spin_once(self, timeout_sec=0.0)
-            self.get_clock().sleep_for(rclpy.duration.Duration(seconds=0.1))
-        self.get_logger().info(f"Published background cloud: {pts_bg.shape[0]} points")
+        if pts_bg.shape[0] == 0:
+            self.node.get_logger().warn("Background pointcloud is EMPTY! OctoMap will not update.")
+        else:
+            # 增加发布次数和时间，确保OctoMap有足够时间处理
+            for i in range(30):
+                self._publish_pointcloud(pts_bg)
+                rclpy.spin_once(self.node, timeout_sec=0.0)
+                self.node.get_clock().sleep_for(rclpy.duration.Duration(seconds=0.05))
+            self.node.get_logger().info(f"Published background cloud: {pts_bg.shape[0]} points")
 
     def remove_instance_hull(self, instance_id: str):
         """移除目标物品凸包"""
         self.disabled_instance_ids.add(instance_id)
         if not self._apply_scene_cli.wait_for_service(timeout_sec=3.0):
-            self.get_logger().warn("/apply_planning_scene not ready; ""object will be removed on next update_scene()")
             return
-        
+
         scene = PlanningScene()
         scene.is_diff = True
 
@@ -234,12 +262,11 @@ class SceneManager(Node):
             with open(seg_json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
-            self.get_logger().error(f"Failed to load JSON: {e}")
+            self.node.get_logger().error(f"Failed to load JSON: {e}")
             return []
 
         results = data.get("results", [])
         if not results:
-            self.get_logger().warn("JSON has no 'results' field or it's empty")
             return []
 
         r0 = results[0]
@@ -352,7 +379,7 @@ class SceneManager(Node):
     def _publish_pointcloud(self, pts: np.ndarray):
         """发布点云消息"""
         header = Header()
-        header.stamp = self.get_clock().now().to_msg()
+        header.stamp = self.node.get_clock().now().to_msg()
         header.frame_id = self.frame_id
         msg = point_cloud2.create_cloud_xyz32(header, pts.tolist())
         self.pub.publish(msg)
@@ -360,7 +387,6 @@ class SceneManager(Node):
     def _apply_collision_meshes(self, meshes: list[tuple[str, Mesh]]):
         """应用碰撞Mesh到规划场景"""
         if not self._apply_scene_cli.service_is_ready():
-            self.get_logger().warn("/apply_planning_scene not ready")
             return
 
         scene = PlanningScene()
@@ -378,85 +404,35 @@ class SceneManager(Node):
         req = ApplyPlanningScene.Request()
         req.scene = scene
         fut = self._apply_scene_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=2.0)
+        rclpy.spin_until_future_complete(self.node, fut, timeout_sec=2.0)
 
 # ==================== 示例用法 ====================
-def example_global_camera():
+def example_with_config():
+    """使用config文件初始化SceneManager"""
     rclpy.init()
 
-    node = SceneManager(
-        frame_id="link_base",
-        fx=909.3394775390625,
-        fy=909.4758911132812,
-        cx=641.5870361328125,
-        cy=366.2402038574219,
-        t_cam2base=np.array([0.2841978143734812, 0.5863733266716398, 0.6697952146289642]),
-        q_cam2base=np.array([-0.013533359025904265, 0.9451953069002206, -0.32610849391775976, -0.008713793775618437]),
-        depth_scale=0.001,
-        max_range_m=3.0,
-        min_range_m=0.02,
-        stride=1,
-        score_thresh=0.3,
-    )
-    
-    # 更新场景
-    depth_path="/home/bb/下载/3DGrasp-BMv1/grasp-global-dpt_opt.png"
-    seg_json_path="/home/bb/桌面/rgb检测分割结果global"
-    node.update_scene(depth_path=depth_path, seg_json_path=seg_json_path)
-    
-    def remove_bottle():
-        node.remove_instance_hull("bottle_0")
-        remove_timer.cancel()
+    # 创建一个简单的ROS2节点作为父节点
+    parent_node = Node("scene_manager_example")
 
-    remove_timer = node.create_timer(5.0, remove_bottle)
-    
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    
-    node.destroy_node()
-    rclpy.shutdown()
+    # 加载配置
+    with open("config/xarm7_config.json", 'r') as f:
+        config = json.load(f)
 
-def example_wrist_camera():
-    rclpy.init()
+    # 创建SceneManager，传入父节点
+    scene_mgr = SceneManager(node=parent_node, config=config)
 
-    node = SceneManager(
-        frame_id="link_base",
-        fx=909.6648559570312,
-        fy=909.5330200195312,
-        cx=636.739013671875,
-        cy=376.3500061035156,
-        t_cam2base=np.array([0.32508802, 0.02826776,  0.65804681]), # TODO:z应为0.458046821
-        q_cam2base=np.array([-0.70315987,  0.71022054, -0.02642658,  0.02132171]),
-        depth_scale=0.001,
-        max_range_m=3.0,
-        min_range_m=0.02,
-        stride=4,
-        score_thresh=0.3,
-    )
+    depth_path = "test_data/grasp-wrist-dpt_opt.png"
+    seg_json_path = "test_data/rgb_detection_wrist"
 
-    depth_path = "/home/bb/下载/3DGrasp-BMv1/grasp-wrist-dpt_opt.png"
-    seg_json_path = "/home/bb/桌面/rgb检测分割结果wrist"
-
-    node.update_scene(depth_path=depth_path, seg_json_path=seg_json_path)
-    
-    # 5 秒后移除 bottle_0
-    # def remove_bottle():
-    #     node.remove_instance_hull("bottle_0")
-    #     remove_timer.cancel()
-
-    # remove_timer = node.create_timer(5.0, remove_bottle)
+    scene_mgr.update_scene(depth_path=depth_path, seg_json_path=seg_json_path)
 
     try:
-        rclpy.spin(node)
+        rclpy.spin(parent_node)
     except KeyboardInterrupt:
         pass
 
-    node.destroy_node()
+    parent_node.destroy_node()
     rclpy.shutdown()
 
 if __name__ == "__main__":
-    # 选择运行哪个示例
-    example_wrist_camera()
-    # example_global_camera()
+    example_with_config()
