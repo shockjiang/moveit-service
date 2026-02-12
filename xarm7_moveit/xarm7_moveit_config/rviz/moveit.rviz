@@ -22,7 +22,7 @@ Panels:
     Name: Views
     Splitter Ratio: 0.5
 Visualization Manager:
-  Class: ""
+  Class: "XXX"
   Displays:
     - Alpha: 0.5
       Cell Size: 1
@@ -135,7 +135,7 @@ Visualization Manager:
         Goal State Color: 250; 128; 0
         Interactive Marker Size: 0
         Joint Violation Color: 255; 0; 255
-        Planning Group: xarm5
+        Planning Group: xarm7
         Query Goal State: true
         Query Start State: false
         Show Workspace: false
@@ -261,10 +261,10 @@ Visualization Manager:
       TF Prefix: ""
       Update Interval: 0
       Value: true
-      Visual Enabled: true
+      Visual Enabled: false
     - Class: moveit_rviz_plugin/Trajectory
       Color Enabled: false
-      Enabled: true
+      Enabled: false 
       Interrupt Display: false
       Links:
         All Links Enabled: true

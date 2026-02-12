@@ -75,6 +75,7 @@ def pose_identity() -> Pose:
     return p
 
 class SceneManager:
+<<<<<<< HEAD
     def __init__(self, node: Node, config: dict = None, **kwargs):
         """
         Args:
@@ -118,6 +119,21 @@ class SceneManager:
             self.score_thresh = float(kwargs.get("score_thresh", 0.3))
             self.t_cam2base = np.asarray(kwargs.get("t_cam2base"), dtype=np.float64).reshape(3)
             self.q_cam2base = np.asarray(kwargs.get("q_cam2base"), dtype=np.float64).reshape(4)
+=======
+    def __init__(self, node: Node, frame_id: str,fx: float, fy: float, cx: float, cy: float,t_cam2base: np.ndarray,q_cam2base: np.ndarray,depth_scale: float = 0.001,max_range_m: float = 3.0,min_range_m: float = 0.02,stride: int = 1,score_thresh: float = 0.3,):
+        self.node = node
+        # 相机参数
+        self.frame_id = frame_id
+        self.fx = float(fx)
+        self.fy = float(fy)
+        self.cx = float(cx)
+        self.cy = float(cy)
+        self.depth_scale = float(depth_scale)
+        self.max_range_m = float(max_range_m)
+        self.min_range_m = float(min_range_m)
+        self.stride = int(stride)
+        self.score_thresh = float(score_thresh)
+>>>>>>> d638f01 (revise)
 
         self.R_cam2base = R.from_quat(self.q_cam2base).as_matrix()
 
@@ -140,8 +156,17 @@ class SceneManager:
         # ROS2 服务客户端
         self._clear_cli = self.node.create_client(Empty, "/clear_octomap")
         self._apply_scene_cli = self.node.create_client(ApplyPlanningScene, "/apply_planning_scene")
+<<<<<<< HEAD
 
     def update_scene(self, depth_path: str, seg_json_path: str):
+=======
+
+        self.node.get_logger().info(f"SceneManager initialized: frame={self.frame_id}, "f"topic={self.topic}, stride={self.stride}")
+
+    def update_scene(self, depth_path: str, seg_json_path: str):
+        self.node.get_logger().info(f"Updating scene: depth={depth_path}, seg={seg_json_path}")
+
+>>>>>>> d638f01 (revise)
         # 1. 清除OctoMap
         if self._clear_cli.wait_for_service(timeout_sec=2.0):
             try:
@@ -191,8 +216,15 @@ class SceneManager:
 
         if base_z is not None:
             table_filter_margin = 0.01
+<<<<<<< HEAD
         else:
             table_filter_margin = None
+=======
+            # self.node.get_logger().info(f"Estimated base_z={base_z:.4f} m, filter_margin={table_filter_margin:.3f} m")
+        else:
+            table_filter_margin = None
+            self.node.get_logger().warn("No base_z estimated; will skip base-point filtering")
+>>>>>>> d638f01 (revise)
 
         # 7. 先为每个启用的实例生成凸包
         k = 7 if self.stride <= 2 else 5
@@ -214,6 +246,10 @@ class SceneManager:
 
             mesh = self._mesh_from_convex_hull(pts_obj)
             if mesh is None:
+<<<<<<< HEAD
+=======
+                self.node.get_logger().warn(f"Failed to create hull for {inst_id}")
+>>>>>>> d638f01 (revise)
                 continue
             meshes.append((inst_id, mesh))
             self.processed_meshes[inst_id] = mesh
@@ -221,6 +257,7 @@ class SceneManager:
         # 8. Apply 碰撞场景（凸包先上场景）
         if meshes:
             if not self._apply_scene_cli.wait_for_service(timeout_sec=2.0):
+<<<<<<< HEAD
                 self.node.get_logger().warn("/apply_planning_scene not ready")
             else:
                 self._apply_collision_meshes(meshes)
@@ -236,11 +273,30 @@ class SceneManager:
                 rclpy.spin_once(self.node, timeout_sec=0.0)
                 self.node.get_clock().sleep_for(rclpy.duration.Duration(seconds=0.05))
             self.node.get_logger().info(f"Published background cloud: {pts_bg.shape[0]} points")
+=======
+                self.node.get_logger().warn("/apply_planning_scene not ready; skip applying meshes")
+            else:
+                self._apply_collision_meshes(meshes)
+            self.node.get_logger().info(f"Applied {len(meshes)} collision meshes")
+        else:
+            self.node.get_logger().info("No meshes to apply")
+
+        # 9. 发布背景点云给 OctoMap
+        for _ in range(10):
+            self._publish_pointcloud(pts_bg)
+            rclpy.spin_once(self.node, timeout_sec=0.0)
+            self.node.get_clock().sleep_for(rclpy.duration.Duration(seconds=0.1))
+        self.node.get_logger().info(f"Published background cloud: {pts_bg.shape[0]} points")
+>>>>>>> d638f01 (revise)
 
     def remove_instance_hull(self, instance_id: str):
         """移除目标物品凸包"""
         self.disabled_instance_ids.add(instance_id)
         if not self._apply_scene_cli.wait_for_service(timeout_sec=3.0):
+<<<<<<< HEAD
+=======
+            self.node.get_logger().warn("/apply_planning_scene not ready; ""object will be removed on next update_scene()")
+>>>>>>> d638f01 (revise)
             return
 
         scene = PlanningScene()
@@ -267,6 +323,10 @@ class SceneManager:
 
         results = data.get("results", [])
         if not results:
+<<<<<<< HEAD
+=======
+            self.node.get_logger().warn("JSON has no 'results' field or it's empty")
+>>>>>>> d638f01 (revise)
             return []
 
         r0 = results[0]
@@ -387,6 +447,10 @@ class SceneManager:
     def _apply_collision_meshes(self, meshes: list[tuple[str, Mesh]]):
         """应用碰撞Mesh到规划场景"""
         if not self._apply_scene_cli.service_is_ready():
+<<<<<<< HEAD
+=======
+            self.node.get_logger().warn("/apply_planning_scene not ready")
+>>>>>>> d638f01 (revise)
             return
 
         scene = PlanningScene()
