@@ -1151,34 +1151,16 @@ class XArmGraspExecutor(Node):
 
 
 def _trajectory_to_json_safe(traj) -> Optional[Dict[str, Any]]:
-    """将RobotTrajectory转换为JSON安全的格式（包含完整路径点信息）"""
+    """将RobotTrajectory转换为JSON安全的格式"""
     if traj is None:
         return None
     try:
-        jt = traj.joint_trajectory
-        points = []
-        for pt in jt.points:
-            point_data = {
-                "positions": list(pt.positions),
-                "time_from_start": pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
-            }
-            # 可选字段
-            if pt.velocities:
-                point_data["velocities"] = list(pt.velocities)
-            if pt.accelerations:
-                point_data["accelerations"] = list(pt.accelerations)
-            if pt.effort:
-                point_data["effort"] = list(pt.effort)
-            points.append(point_data)
-
         return {
-            "joint_names": list(jt.joint_names),
-            "points": points,
-            "num_points": len(points),
-            "total_duration": points[-1]["time_from_start"] if points else 0.0
+            "num_points": len(traj.joint_trajectory.points),
+            "duration": traj.joint_trajectory.points[-1].time_from_start.sec if traj.joint_trajectory.points else 0
         }
-    except Exception as e:
-        return {"error": f"Failed to serialize trajectory: {str(e)}"}
+    except:
+        return {"info": "trajectory_data"}
 
 
 def _execute_grasp_core(
