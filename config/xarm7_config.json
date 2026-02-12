@@ -37,7 +37,7 @@
     },
     
     "grasp": {
-        "pregrasp_offset": 0.10,
+        "pregrasp_offset": 0.20,
         "pregrasp_approach_axis": [0.0, 0.0, -1.0],
         "extra_open": 0.020,
         "pixel_to_meter": 0.0001
@@ -72,6 +72,6 @@
     "home": {
         "position": [0.270, 0.0, 0.307],
         "orientation": [-3.14159, 0.0, 0.0],
-        "joints": [0.1, -41.1, -0.6, 45.2, 0.7, 86.3, 0.6]
+        "joints": [0.001745, -0.71733, -0.010472, 0.788889, 0.012217, 1.506219, 0.010472]
     }
 }

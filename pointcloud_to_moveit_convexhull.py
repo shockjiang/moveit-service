@@ -240,12 +240,22 @@ class SceneManager:
         if pts_bg.shape[0] == 0:
             self.node.get_logger().warn("Background pointcloud is EMPTY! OctoMap will not update.")
         else:
-            # 增加发布次数和时间，确保OctoMap有足够时间处理
+            # 检查订阅者数量
+            sub_count = self.pub.get_subscription_count()
+            self.node.get_logger().info(f"Point cloud topic has {sub_count} subscriber(s)")
+
+            if sub_count == 0:
+                self.node.get_logger().warn("⚠ No subscribers for point cloud! OctoMap monitor may not be running.")
+            else:
+                self.node.get_logger().info(f"✓ OctoMap monitor is active and subscribing to point cloud")
+
+            # 发布点云（无论是否有订阅者，为将来的 monitor 准备）
+            self.node.get_logger().info(f"Publishing background cloud: {pts_bg.shape[0]} points to {self.topic} in frame {self.frame_id}")
             for i in range(30):
                 self._publish_pointcloud(pts_bg)
                 rclpy.spin_once(self.node, timeout_sec=0.0)
                 self.node.get_clock().sleep_for(rclpy.duration.Duration(seconds=0.05))
-            self.node.get_logger().info(f"Published background cloud: {pts_bg.shape[0]} points")
+            self.node.get_logger().info(f"✓ Finished publishing background cloud (30 times over 1.5s)")
 
     def remove_instance_hull(self, instance_id: str):
         """移除目标物品凸包"""

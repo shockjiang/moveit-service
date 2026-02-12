@@ -1,6 +1,7 @@
-# 配置文件放置路径xarm_ros2/xarm_moveit_config/config/xarm7
+# OctoMap 3D 传感器配置
+# 配置文件路径: xarm_moveit_config/config/sensors_3d.yaml
 sensors: ['ros']
-octomap_frame: world
+octomap_frame: link_base  # 修改为 link_base 以匹配点云坐标系
 octomap_resolution: 0.02
 
 ros.sensor_plugin: occupancy_map_monitor/PointCloudOctomapUpdater
