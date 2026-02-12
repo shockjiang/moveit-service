@@ -37,6 +37,10 @@ class MoveArmClient(Node):
         """Check if the MoveIt action server is available"""
         self.get_logger().info('Checking for MoveIt action server...')
         alive = self._action_client.wait_for_server(timeout_sec=5.0)
+        #add checking for FK and IK services as well, any of them is not available, we consider MoveIt is not fully available
+        fk_alive = self._fk_client.wait_for_service(timeout_sec=2.0)
+        ik_alive = self._ik_client.wait_for_service(timeout_sec=2.0)
+        alive = alive and fk_alive and ik_alive
         if alive:
             self.get_logger().info('moveit service is available!')
         else:
@@ -327,7 +331,7 @@ def main():
     home = {
         "position": [0.270, 0.0, 0.307],
         "orientation": [-3.14159, 0.0, 0.0],
-        # "joints": [0.1, -41.1, -0.6, 45.2, 0.7, 86.3, 0.6]
+        "joints": [0.1, -41.1, -0.6, 45.2, 0.7, 86.3, 0.6]
     }
     
 
@@ -375,7 +379,7 @@ def main():
                 print(f"✗ IK failed with error code: {result.error_code.val}")
                 return
         else:
-            print("✗ IK computation timed out")
+            print("✗ IK computation timed out and exit")
             return
 
     # Convert home position from degrees to radians

@@ -1185,8 +1185,8 @@ def plan_grasps(
     target_object_index: Optional[int] = None,
     execution_mode: bool = False,
     depth_path: str = "test_data/grasp-wrist-dpt_opt.png",
-    seg_json_path: str = "test_data/rgb检测分割结果wrist",
-    affordance_path: str = "test_data/affordance"
+    seg_json_path: str = "test_data/rgb_detection_wrist.json",
+    affordance_path: str = "test_data/affordance.json"
 ) -> List[Dict[str, Any]]:
     """抓取规划主函数（命令行模式）"""
     # 初始化ROS
@@ -1239,8 +1239,8 @@ def main():
         target_object_index=None,
         execution_mode=True,
         depth_path="test_data/grasp-wrist-dpt_opt.png",
-        seg_json_path="test_data/rgb_detection_wrist",
-        affordance_path="test_data/affordance"
+        seg_json_path="test_data/rgb_detection_wrist.json",
+        affordance_path="test_data/affordance.json"
     )
 
     sys.exit(0)
