@@ -20,6 +20,7 @@ alias python3=/usr/bin/python3
 if [[ ":$PATH:" != ":/usr/bin:"* ]]; then
     export PATH=/usr/bin:$PATH
 fi
+
 pip3 install -r requirements.txt --break-system-packages --user --ignore-installed
 apt update
 apt install ros-jazzy-moveit-ros-perception ros-jazzy-octomap-rviz-plugins
