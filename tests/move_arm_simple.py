@@ -25,13 +25,15 @@ import json
 import math
 
 class MoveArmClient(Node):
-    def __init__(self):
+    def __init__(self, end_effector_link='link_eef'):
         super().__init__('move_arm_client')
         self._action_client = ActionClient(self, MoveGroup, '/move_action')
         self._fk_client = self.create_client(GetPositionFK, '/compute_fk')
         self._ik_client = self.create_client(GetPositionIK, '/compute_ik')
         self.timeout_sec = 5.0
         self.joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
+        self.end_effector_link = end_effector_link  # 'link_eef' or 'link_tcp'
+        self.get_logger().info(f'Using end effector link: {self.end_effector_link}')
 
     def is_moveit_server_available(self):
         """Check if the MoveIt action server is available"""
@@ -181,7 +183,7 @@ class MoveArmClient(Node):
             if fk_available:
                 request = GetPositionFK.Request()
                 request.header.frame_id = 'link_base'
-                request.fk_link_names = ['link_eef']
+                request.fk_link_names = [self.end_effector_link]
 
                 joint_state = JointState()
                 joint_state.name = self.joint_names
@@ -264,7 +266,7 @@ class MoveArmClient(Node):
         # Position constraint
         pos_constraint = PositionConstraint()
         pos_constraint.header.frame_id = "link_base"
-        pos_constraint.link_name = "link_eef"
+        pos_constraint.link_name = self.end_effector_link
         pos_constraint.target_point_offset.x = 0.0
         pos_constraint.target_point_offset.y = 0.0
         pos_constraint.target_point_offset.z = 0.0
@@ -281,7 +283,7 @@ class MoveArmClient(Node):
         # Orientation constraint
         orient_constraint = OrientationConstraint()
         orient_constraint.header.frame_id = "link_base"
-        orient_constraint.link_name = "link_eef"
+        orient_constraint.link_name = self.end_effector_link
         orient_constraint.orientation = pose_stamped.pose.orientation
         orient_constraint.absolute_x_axis_tolerance = 0.1
         orient_constraint.absolute_y_axis_tolerance = 0.1
@@ -326,7 +328,9 @@ class MoveArmClient(Node):
 
 def main():
     rclpy.init()
-    client = MoveArmClient()
+    end = 'link_tcp' if len(sys.argv) > 1 and sys.argv[1] == 'tcp' else 'link_eef'
+    end = 'link_tcp'
+    client = MoveArmClient(end_effector_link=end)
 
     print("\n=== xArm Movement Test ===")
 
@@ -392,7 +396,7 @@ def main():
         ik_request.ik_request.timeout.sec = 5
 
         # Set the link name for which to compute IK
-        ik_request.ik_request.ik_link_name = "link_eef"
+        ik_request.ik_request.ik_link_name = client.end_effector_link
 
         # Set target pose
         ik_request.ik_request.pose_stamped.header.frame_id = "link_base"
@@ -430,7 +434,7 @@ def main():
         # Prepare FK request
         fk_request = GetPositionFK.Request()
         fk_request.header.frame_id = 'link_base'
-        fk_request.fk_link_names = ['link_eef']
+        fk_request.fk_link_names = [client.end_effector_link]
 
         joint_state = JointState()
         joint_state.name = client.joint_names
@@ -505,7 +509,7 @@ def main():
 
         # Example 2: Move to a pose with home as start state (uncomment to test)
         print("\nMoving to target pose from home...")
-        success = client.send_pose_goal(end_pos=target["end_effector"], plan_only=True, start_pos=home_joints)
+        success = client.send_pose_goal(end_pos=target["end_effector"], plan_only=False, start_pos=home_joints)
         if success:
             print("✓ Movement succeeded!")
         else:
