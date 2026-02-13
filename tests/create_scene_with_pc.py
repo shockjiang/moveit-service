@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Create MoveIt planning scene from point cloud using mesh collision objects.
+Create MoveIt planning scene from point cloud using PointCloud2 and octomap_server.
+This script:
+1. Publishes PointCloud2 to /scene_cloud
+2. Subscribes to /octomap_binary from octomap_server
+3. Republishes as PlanningScene message for MoveIt
 """
 
 from pathlib import Path
@@ -10,6 +14,7 @@ import sys
 import numpy as np
 import os
 import time
+import struct
 sys.path.append('data/3DGrasp-BMv1/')
 sys.path.append('../data/3DGrasp-BMv1/')
 
@@ -17,10 +22,10 @@ from frame_cvt import *
 
 import rclpy
 from rclpy.node import Node
-from moveit_msgs.msg import PlanningScene, CollisionObject
-from shape_msgs.msg import Mesh, MeshTriangle, SolidPrimitive
-from geometry_msgs.msg import Pose, Point
-from scipy.spatial import ConvexHull
+from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import Header
+from moveit_msgs.msg import PlanningScene, PlanningSceneWorld
+from octomap_msgs.msg import Octomap
 
 
 def load_res(dataset_dir):
@@ -56,66 +61,99 @@ def load_res(dataset_dir):
         flange_to_tool_translation_m=flange_to_tool,
     )
 
+
     return wrist_base, cfg
 
 
-def pc2boxes(pcd, voxel_size=0.05):
+def create_pointcloud2(points, frame_id='world'):
     """
-    Convert point cloud to box collision objects.
-    This is more stable for MoveIt than complex meshes.
+    Create a PointCloud2 message from numpy array.
+
+    Args:
+        points: Nx3 numpy array of XYZ points
+        frame_id: Frame ID for the point cloud
+
+    Returns:
+        PointCloud2 message
     """
-    # Flatten point cloud if needed
-    if pcd.ndim == 3:
-        pcd = pcd.reshape(-1, 3)
+    # Flatten if needed
+    if points.ndim == 3:
+        points = points.reshape(-1, 3)
 
     # Filter out invalid points
-    valid_mask = (pcd[:, 2] > 0.05) & (pcd[:, 2] < 1.5)  # Z between 5cm and 1.5m
-    valid_mask &= np.all(np.isfinite(pcd), axis=1)
-    pcd_valid = pcd[valid_mask]
+    valid_mask = (points[:, 2] > 0.05) & (points[:, 2] < 1.5)  # Z between 5cm and 1.5m
+    valid_mask &= np.all(np.isfinite(points), axis=1)
+    points = points[valid_mask]
 
-    print(f"Valid points: {len(pcd_valid)} / {len(pcd)}")
+    print(f"Valid points: {len(points)}")
 
-    if len(pcd_valid) < 10:
+    if len(points) < 10:
         raise ValueError("Not enough valid points")
 
-    # Voxelize to create boxes
-    print(f"Voxelizing with size {voxel_size}m...")
-    voxel_coords = np.floor(pcd_valid / voxel_size).astype(np.int32)
-    unique_voxels = np.unique(voxel_coords, axis=0)
+    # Create PointCloud2 message
+    msg = PointCloud2()
+    msg.header = Header()
+    msg.header.frame_id = frame_id
+    msg.header.stamp = rclpy.clock.Clock().now().to_msg()
 
-    # Convert voxel coordinates back to world coordinates (voxel centers)
-    box_centers = (unique_voxels + 0.5) * voxel_size
+    # Define fields (x, y, z)
+    msg.fields = [
+        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+    ]
 
-    print(f"Created {len(box_centers)} boxes")
+    msg.is_bigendian = False
+    msg.point_step = 12  # 3 floats * 4 bytes
+    msg.row_step = msg.point_step * len(points)
+    msg.is_dense = True
+    msg.width = len(points)
+    msg.height = 1
 
-    return box_centers, voxel_size
+    # Pack point data
+    buffer = []
+    for point in points:
+        buffer.append(struct.pack('fff', point[0], point[1], point[2]))
+
+    msg.data = b''.join(buffer)
+
+    return msg
 
 
-def create_box_collision_object(box_centers, box_size, frame_id='world', object_id='scene_boxes'):
-    """
-    Create a CollisionObject message with box primitives.
-    """
-    collision_object = CollisionObject()
-    collision_object.header.frame_id = frame_id
-    collision_object.id = object_id
-    collision_object.operation = CollisionObject.ADD
+class OctomapBridge(Node):
+    """Bridge between octomap_server and MoveIt planning scene."""
 
-    # Add each box as a primitive
-    for center in box_centers:
-        box = SolidPrimitive()
-        box.type = SolidPrimitive.BOX
-        box.dimensions = [box_size, box_size, box_size]
+    def __init__(self):
+        super().__init__('octomap_bridge')
 
-        pose = Pose()
-        pose.position.x = float(center[0])
-        pose.position.y = float(center[1])
-        pose.position.z = float(center[2])
-        pose.orientation.w = 1.0
+        # Publisher for planning scene
+        self.scene_pub = self.create_publisher(PlanningScene, '/planning_scene', 10)
 
-        collision_object.primitives.append(box)
-        collision_object.primitive_poses.append(pose)
+        # Subscriber for octomap
+        self.octomap_sub = self.create_subscription(
+            Octomap,
+            '/octomap_binary',
+            self.octomap_callback,
+            10
+        )
 
-    return collision_object
+        self.get_logger().info('Octomap bridge started')
+        self.get_logger().info('Subscribing to /octomap_binary')
+        self.get_logger().info('Publishing to /planning_scene')
+
+    def octomap_callback(self, octomap_msg):
+        """Receive octomap and publish as planning scene."""
+        self.get_logger().info(f'Received octomap: {len(octomap_msg.data)} bytes')
+
+        # Create planning scene message
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.world.octomap.header = octomap_msg.header
+        scene.world.octomap.octomap = octomap_msg
+
+        # Publish to planning scene
+        self.scene_pub.publish(scene)
+        self.get_logger().info('Published octomap to planning scene')
 
 
 def main():
@@ -124,41 +162,46 @@ def main():
     print(f"Loading point cloud from {dataset_dir}...")
     pc, cfg = load_res(dataset_dir)
 
-    # Convert to boxes (more stable than mesh for MoveIt)
-    box_centers, box_size = pc2boxes(pc, voxel_size=0.05)
-
     # Initialize ROS2
     rclpy.init()
-    node = Node('scene_box_publisher')
 
-    # Create publisher
-    pub = node.create_publisher(PlanningScene, '/planning_scene', 10)
+    # Create nodes
+    pc_node = Node('scene_pointcloud_publisher')
+    bridge_node = OctomapBridge()
 
-    # Wait for subscribers
-    print("Waiting for /planning_scene subscribers...")
-    while pub.get_subscription_count() == 0:
-        time.sleep(0.1)
-    print(f"Found {pub.get_subscription_count()} subscriber(s)")
+    # Create publisher for PointCloud2
+    pc_pub = pc_node.create_publisher(PointCloud2, '/scene_cloud', 10)
 
-    # Create planning scene message
-    planning_scene = PlanningScene()
-    planning_scene.is_diff = True
-    planning_scene.world.collision_objects.append(
-        create_box_collision_object(box_centers, box_size, frame_id='world', object_id='scene_boxes')
-    )
+    # Wait for connections
+    print("Waiting for connections...")
+    time.sleep(1.0)
 
-    # Publish
-    print(f"Publishing box collision objects to /planning_scene...")
-    pub.publish(planning_scene)
-    time.sleep(0.5)
+    # Create and publish PointCloud2
+    pc_msg = create_pointcloud2(pc, frame_id='world')
 
-    print(f"✓ Published {len(box_centers)} boxes (voxel size: {box_size}m)")
-    print("✓ Check RViz PlanningScene display to see the boxes")
+    print(f"Publishing PointCloud2 to /scene_cloud...")
+    print(f"  Points: {pc_msg.width}")
+    print(f"  Frame: {pc_msg.header.frame_id}")
 
-    # Cleanup - only destroy node, don't shutdown rclpy context
-    # This prevents interfering with other ROS nodes
-    node.destroy_node()
-    # Note: Not calling rclpy.shutdown() to avoid affecting other nodes
+    # Publish point cloud
+    for i in range(5):
+        pc_pub.publish(pc_msg)
+        time.sleep(0.2)
+
+    print("✓ Published PointCloud2")
+    print("\nWaiting for octomap from octomap_server...")
+    print("The bridge will automatically forward it to MoveIt's planning scene")
+
+    # Spin the bridge node to receive and forward octomaps
+    try:
+        rclpy.spin(bridge_node)
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+
+    # Cleanup
+    pc_node.destroy_node()
+    bridge_node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == '__main__':

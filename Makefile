@@ -2,6 +2,7 @@ SHELL := /bin/bash
 .SHELLFLAGS := -e -o pipefail -c
 .ONESHELL:
 
+#sudo apt install -y ros-jazzy-octomap-server ros-jazzy-octomap-ros ros-jazzy-octomap-rviz-plugins
 set-env:
 	source set-env.sh
 
@@ -20,6 +21,14 @@ build:
 run: # must be run with rviz
 	source set-env.sh
 	ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false
+
+octo-server:
+	source set-env.sh
+	ros2 run octomap_server octomap_server_node --ros-args \
+		-p frame_id:=world \
+		-p resolution:=0.001 \
+		-r cloud_in:=/scene_cloud
+
 
 # 	xvfb-run ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false 2 > log/moveit.log & tail -f log/moveit.log
 
