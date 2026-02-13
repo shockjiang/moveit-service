@@ -5,6 +5,11 @@ SHELL := /bin/bash
 set-env:
 	source set-env.sh
 
+
+debug:
+	source set-env.sh
+	/usr/bin/python3 tests/create_scene_with_pc.py
+
 exec:
 	docker exec -it  -e DISPLAY=:1 -w /workspace/moveit-service sif bash
 
@@ -20,6 +25,7 @@ run: # must be run with rviz
 
 run-vis:
 	source set-env.sh
+	export DISPLAY=:1
 	ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py 
 
 test:
@@ -42,6 +48,7 @@ stop-all:
 	pkill -9 -f _ros2_daemon
 	pkill -9 -f /opt/ros/
 	pkill -9 -f /move_group
+	pkill -f /opt/ros/
 	pkill -9 Xvfb
 	
 
