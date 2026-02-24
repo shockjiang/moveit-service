@@ -195,7 +195,7 @@ class SceneManager:
         # 5. 构建背景点云mask（膨胀物体mask，排除凸包边缘区域）
         if full_masks:
             union_mask = np.logical_or.reduce(full_masks)
-            dilate_kernel = np.ones((100, 100), np.uint8)
+            dilate_kernel = np.ones((15, 15), np.uint8)
             union_mask_dilated = cv2.dilate(union_mask.astype(np.uint8), dilate_kernel, iterations=3).astype(bool)
             bg_mask = ~union_mask_dilated
             self.node.get_logger().info(
@@ -286,7 +286,7 @@ class SceneManager:
 
             # 发布点云（增加次数和间隔，确保 octomap 充分消费）
             self.node.get_logger().info(f"Publishing background cloud: {pts_bg.shape[0]} points to {self.topic} in frame {self.frame_id}")
-            for i in range(20):
+            for i in range(5):
                 self._publish_pointcloud(pts_bg)
                 rclpy.spin_once(self.node, timeout_sec=0.0)
                 self.node.get_clock().sleep_for(rclpy.duration.Duration(seconds=0.1))
@@ -503,7 +503,7 @@ def example_with_config():
     # 创建SceneManager，传入父节点
     scene_mgr = SceneManager(node=parent_node, config=config)
 
-    depth_path = "data/3DGrasp-BMv1/grasp-wrist-dpt_opt.png"
+    depth_path = "test_data/grasp-wrist-dpt_opt.png"
     seg_json_path = "test_data/rgb_detection_wrist.json"
 
     scene_mgr.update_scene(depth_path=depth_path, seg_json_path=seg_json_path)

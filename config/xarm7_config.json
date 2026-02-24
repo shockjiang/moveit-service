@@ -51,7 +51,7 @@
     
     "basket": {
         "default_id": "basket_1",
-        "center": [0.4, 0.3, 0.1],
+        "center": [0.4, -0.55, 0.1],
         "outer_size": [0.3, 0.2, 0.15],
         "wall_thickness": 0.005,
         "bottom_thickness": 0.005,

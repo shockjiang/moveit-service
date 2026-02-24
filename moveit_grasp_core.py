@@ -8,7 +8,6 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
-from flask import Flask, request, jsonify
 
 from geometry_msgs.msg import PoseStamped, Point, Pose,Quaternion
 from sensor_msgs.msg import JointState
@@ -83,7 +82,7 @@ class XArmGraspExecutor(Node):
         self.gripper_move_client = ActionClient(self, FollowJointTrajectory,"/xarm_gripper_traj_controller/follow_joint_trajectory")
         self.cartesian_path_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
         self.scene_pub = self.create_publisher(PlanningScene, "/planning_scene", 10)
-        
+
         # Wait for action servers
         if not self.move_action_client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError("MoveGroup action server not responding")
@@ -91,7 +90,7 @@ class XArmGraspExecutor(Node):
             self.get_logger().warn("ExecuteTrajectory action server not responding")
         if self.execution_mode and not self.gripper_move_client.wait_for_server(timeout_sec=10.0):
             self.get_logger().warn("Gripper action server not responding")
-        
+
         # Wait for service
         if not self.cartesian_path_client.wait_for_service(timeout_sec=10.0):
             self.get_logger().warn("Cartesian path service not available")
@@ -188,7 +187,7 @@ class XArmGraspExecutor(Node):
             return []
 
         self.get_logger().info(f"Loaded depth image: shape={depth_img.shape}, dtype={depth_img.dtype}, min={depth_img.min()}, max={depth_img.max()}")
-        
+
         try:
             with open(seg_json_path, 'r', encoding='utf-8') as f:
                 seg_data = json.load(f)
@@ -196,7 +195,7 @@ class XArmGraspExecutor(Node):
             text_prompt = str(results[0].get("text_prompt", "obj")) if results else "obj"
         except:
             text_prompt = "obj"
-        
+
         # 判断要处理哪些物品，是否有目标物品
         all_candidates = []
         if target_object_index is not None:
@@ -229,10 +228,10 @@ class XArmGraspExecutor(Node):
                     self.get_logger().warn(f"Skipping candidate {obj_idx}-{aff_idx}: transform_to_base returned None for u={u}, v={v}")
                     continue
 
-                self.get_logger().info(f"Candidate {obj_idx}-{aff_idx}: center_base={center_base}")                
+                self.get_logger().info(f"Candidate {obj_idx}-{aff_idx}: center_base={center_base}")
                 width_m = width_px * pixel_to_meter
                 height_m = height_px * pixel_to_meter
-                
+
                 candidate = {
                     "id": len(all_candidates),
                     "object_index": obj_idx,
@@ -244,7 +243,7 @@ class XArmGraspExecutor(Node):
                     "extra_open": float(extra_open),
                     "pixel_coords": [float(u), float(v)]
                 }
-                
+
                 # 如果包含抓取姿态，添加到candidate中
                 if has_grasp_pose:
                     candidate["grasp_pose_rpy"] = grasp_pose_rpy
@@ -255,55 +254,15 @@ class XArmGraspExecutor(Node):
         self.get_logger().info(f"Total candidates generated: {len(all_candidates)}")
         return all_candidates
 
-    def add_open_top_basket_to_scene(
-        self,
-        object_id: str,
-        center: Tuple[float, float, float],
-        outer_size: Tuple[float, float, float],
-        wall_t: float = 0.005,
-        bottom_t: float = 0.005,
-        rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-    ) -> bool:
-        """添加上开口中空的放置框"""
-        L, W, H = map(float, outer_size)
-        wall_t = float(wall_t)
-        bottom_t = float(bottom_t)
-
-        rot = R.from_euler("xyz", list(rpy), degrees=False)
-        c = np.array(center, dtype=float)
-
-        def local_to_world(p_local: np.ndarray) -> Tuple[float, float, float]:
-            p_world = c + rot.apply(p_local)
-            return float(p_world[0]), float(p_world[1]), float(p_world[2])
-
-        # 底板
-        bottom_center_local = np.array([0.0, 0.0, -H/2 + bottom_t/2], dtype=float)
-        self.add_box_to_scene(object_id=f"{object_id}__bottom",center=local_to_world(bottom_center_local),size=(L, W, bottom_t),rpy=rpy,frame_id=self.base_frame,)
-
-        wall_h = H - bottom_t
-        wall_center_z_local = -H/2 + bottom_t + wall_h/2
-        # 两个长边墙
-        long_wall_size = (L, wall_t, wall_h)
-        for sign in (+1.0, -1.0):
-            wall_center_local = np.array([0.0, sign*(W/2 - wall_t/2), wall_center_z_local], dtype=float)
-            self.add_box_to_scene(object_id=f"{object_id}__wall_y{int(sign)}",center=local_to_world(wall_center_local),size=long_wall_size,rpy=rpy,frame_id=self.base_frame,)
-
-        # 两个短边墙
-        short_wall_size = (wall_t, W, wall_h)
-        for sign in (+1.0, -1.0):
-            wall_center_local = np.array([sign*(L/2 - wall_t/2), 0.0, wall_center_z_local], dtype=float)
-            self.add_box_to_scene(object_id=f"{object_id}__wall_x{int(sign)}",center=local_to_world(wall_center_local),size=short_wall_size,rpy=rpy,frame_id=self.base_frame,)
-        return True
-
-    def add_box_to_scene(
+    def _make_box_collision_object(
         self,
         object_id: str,
         center: Tuple[float, float, float],
         size: Tuple[float, float, float],
         rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0),
         frame_id: Optional[str] = None
-    ) -> bool:
-        """添加box障碍物"""
+    ) -> CollisionObject:
+        """构造一个 box CollisionObject（不发布）"""
         pose = Pose()
         pose.position.x, pose.position.y, pose.position.z = map(float, center)
         qx, qy, qz, qw = R.from_euler("xyz", list(rpy), degrees=False).as_quat()
@@ -320,7 +279,72 @@ class XArmGraspExecutor(Node):
         box.dimensions = [float(size[0]), float(size[1]), float(size[2])]
         co.primitives.append(box)
         co.primitive_poses.append(pose)
+        return co
 
+    def add_open_top_basket_to_scene(
+        self,
+        object_id: str,
+        center: Tuple[float, float, float],
+        outer_size: Tuple[float, float, float],
+        wall_t: float = 0.005,
+        bottom_t: float = 0.005,
+        rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ) -> bool:
+        """添加上开口中空的放置框（5个零件打包为一次发布，避免丢消息）"""
+        L, W, H = map(float, outer_size)
+        wall_t = float(wall_t)
+        bottom_t = float(bottom_t)
+
+        rot = R.from_euler("xyz", list(rpy), degrees=False)
+        c = np.array(center, dtype=float)
+
+        def local_to_world(p_local: np.ndarray) -> Tuple[float, float, float]:
+            p_world = c + rot.apply(p_local)
+            return float(p_world[0]), float(p_world[1]), float(p_world[2])
+
+        parts = []
+
+        # 底板
+        bottom_center_local = np.array([0.0, 0.0, -H/2 + bottom_t/2], dtype=float)
+        parts.append(self._make_box_collision_object(
+            f"{object_id}__bottom", local_to_world(bottom_center_local),
+            (L, W, bottom_t), rpy=rpy, frame_id=self.base_frame))
+
+        wall_h = H - bottom_t
+        wall_center_z_local = -H/2 + bottom_t + wall_h/2
+
+        # 两个长边墙
+        for sign in (+1.0, -1.0):
+            wall_center_local = np.array([0.0, sign*(W/2 - wall_t/2), wall_center_z_local], dtype=float)
+            parts.append(self._make_box_collision_object(
+                f"{object_id}__wall_y{int(sign)}", local_to_world(wall_center_local),
+                (L, wall_t, wall_h), rpy=rpy, frame_id=self.base_frame))
+
+        # 两个短边墙
+        for sign in (+1.0, -1.0):
+            wall_center_local = np.array([sign*(L/2 - wall_t/2), 0.0, wall_center_z_local], dtype=float)
+            parts.append(self._make_box_collision_object(
+                f"{object_id}__wall_x{int(sign)}", local_to_world(wall_center_local),
+                (wall_t, W, wall_h), rpy=rpy, frame_id=self.base_frame))
+
+        # 一次性发布所有5个零件
+        ps = PlanningScene()
+        ps.is_diff = True
+        ps.world.collision_objects = parts
+        self.scene_pub.publish(ps)
+        self.get_logger().info(f"Basket '{object_id}' published ({len(parts)} parts in 1 msg)")
+        return True
+
+    def add_box_to_scene(
+        self,
+        object_id: str,
+        center: Tuple[float, float, float],
+        size: Tuple[float, float, float],
+        rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        frame_id: Optional[str] = None
+    ) -> bool:
+        """添加box障碍物"""
+        co = self._make_box_collision_object(object_id, center, size, rpy=rpy, frame_id=frame_id)
         ps = PlanningScene()
         ps.is_diff = True
         ps.world.collision_objects.append(co)
@@ -328,19 +352,26 @@ class XArmGraspExecutor(Node):
         return True
 
     def remove_basket_from_scene(self, basket_id: str) -> bool:
-        parts = [
+        """移除篮子所有零件（打包为一次发布）"""
+        part_ids = [
             f"{basket_id}__bottom",
             f"{basket_id}__wall_y1",
             f"{basket_id}__wall_y-1",
             f"{basket_id}__wall_x1",
             f"{basket_id}__wall_x-1"
         ]
-        
-        for part_id in parts:
-            self.remove_object_from_scene(part_id)
-        
+
+        ps = PlanningScene()
+        ps.is_diff = True
+        for part_id in part_ids:
+            co = CollisionObject()
+            co.id = part_id
+            co.operation = CollisionObject.REMOVE
+            ps.world.collision_objects.append(co)
+        self.scene_pub.publish(ps)
+
         time.sleep(0.3)
-        self.get_logger().info(f"✓ Removed basket '{basket_id}' (5 parts)")
+        self.get_logger().info(f"✓ Removed basket '{basket_id}' ({len(part_ids)} parts in 1 msg)")
         return True
 
 
@@ -348,31 +379,55 @@ class XArmGraspExecutor(Node):
         """清空OctoMap"""
         try:
             from std_srvs.srv import Empty
-            
+
             clear_cli = self.create_client(Empty, "/clear_octomap")
-            
+
             if clear_cli.wait_for_service(timeout_sec=2.0):
                 future = clear_cli.call_async(Empty.Request())
                 self.wait_for_future(future, timeout_sec=2.0)
                 self.get_logger().info("OctoMap cleared")
             else:
                 self.get_logger().warn("/clear_octomap service not available")
-                
+
             self.destroy_client(clear_cli)
-            
+
         except Exception as e:
             self.get_logger().error(f"Failed to clear OctoMap: {e}")
 
     def clear_pointcloud_obstacles(self):
-        """清除所有点云凸包障碍物"""
+        """清除所有点云凸包障碍物（打包为一次 ApplyPlanningScene 调用）"""
         if self.scene_manager is None:
             return
         try:
-            for inst in self.scene_manager.instances:
-                inst_id = inst["id"]
-                self.scene_manager.remove_instance_hull(inst_id)
-            
-            self.get_logger().info("Cleared all convex hull obstacles")
+            ids_to_remove = [inst["id"] for inst in self.scene_manager.instances]
+            if not ids_to_remove:
+                return
+
+            # 标记为disabled
+            for inst_id in ids_to_remove:
+                self.scene_manager.disabled_instance_ids.add(inst_id)
+
+            # 一次性批量移除
+            if self.scene_manager._apply_scene_cli.wait_for_service(timeout_sec=3.0):
+                scene = PlanningScene()
+                scene.is_diff = True
+                for inst_id in ids_to_remove:
+                    co = CollisionObject()
+                    co.id = inst_id
+                    co.header.frame_id = self.scene_manager.frame_id
+                    co.operation = CollisionObject.REMOVE
+                    scene.world.collision_objects.append(co)
+
+                from moveit_msgs.srv import ApplyPlanningScene
+                req = ApplyPlanningScene.Request()
+                req.scene = scene
+                future = self.scene_manager._apply_scene_cli.call_async(req)
+                self.wait_for_future(future, timeout_sec=5.0)
+
+            # 清空disabled标记，让下一次 update_scene 可以正常重建凸包
+            self.scene_manager.disabled_instance_ids.clear()
+
+            self.get_logger().info(f"Cleared {len(ids_to_remove)} convex hull obstacles (1 msg)")
             time.sleep(0.5)
         except Exception as e:
             self.get_logger().error(f"Failed to clear obstacles: {e}")
@@ -425,38 +480,38 @@ class XArmGraspExecutor(Node):
         if instance_id not in self.scene_manager.processed_meshes:
             self.get_logger().error(f"No mesh for '{instance_id}'")
             return False
-        
+
         mesh = self.scene_manager.processed_meshes[instance_id]
-        
+
         try:
             co = CollisionObject()
             co.header.frame_id = self.base_frame
             co.header.stamp = self.get_clock().now().to_msg()
             co.id = instance_id
             co.operation = CollisionObject.ADD
-            
+
             co.meshes.append(mesh)
-            
+
             pose = Pose()
             pose.orientation.w = 1.0
             co.mesh_poses.append(pose)
-            
+
             aco = AttachedCollisionObject()
             aco.link_name = self.gripper_link
             aco.object = co
             aco.touch_links = self.gripper_touch_links
-            
+
             ps = PlanningScene()
             ps.is_diff = True
             ps.robot_state.is_diff = True
             ps.robot_state.attached_collision_objects.append(aco)
             self.scene_pub.publish(ps)
-            
+
             self.attached_objects[instance_id] = aco
-            
+
             self.get_logger().info(f"Attached mesh '{instance_id}' to gripper")
             return True
-            
+
         except Exception as e:
             self.get_logger().error(f"Failed to attach mesh: {e}")
             return False
@@ -491,7 +546,7 @@ class XArmGraspExecutor(Node):
         self.clear_pointcloud_obstacles()
 
         self.get_logger().info("[Scene] Planning scene reset complete")
-    
+
     def remove_object_from_scene(self, object_id: str) -> bool:
         """从场景移除障碍物"""
         co = CollisionObject()
@@ -503,7 +558,7 @@ class XArmGraspExecutor(Node):
         ps.world.collision_objects.append(co)
         self.scene_pub.publish(ps)
         return True
-    
+
     def build_goal(
         self,
         xyz: Sequence[float],
@@ -525,7 +580,7 @@ class XArmGraspExecutor(Node):
 
         req.group_name = self.planning_group
         req.allowed_planning_time = float(allowed_time)
-        
+
         # 设置规划器
         if planner_id:
             req.planner_id = planner_id
@@ -534,7 +589,7 @@ class XArmGraspExecutor(Node):
         js = JointState()
         js.name = ["drive_joint"]
         js.position = [float(max(0.0, min(self.gripper_joint_max, drive_joint_rad)))]
-        
+
         # 如果提供了起始关节状态，使用它而不是is_diff
         if start_joint_state is not None:
             req.start_state.is_diff = False
@@ -657,7 +712,7 @@ class XArmGraspExecutor(Node):
         if not self.cartesian_path_client.service_is_ready():
             self.get_logger().error("Cartesian path service not available")
             return None
-        
+
         req = GetCartesianPath.Request()
         req.header.frame_id = self.base_frame
         req.header.stamp = self.get_clock().now().to_msg()
@@ -684,7 +739,7 @@ class XArmGraspExecutor(Node):
             if future.result() is None:
                 self.get_logger().error("Cartesian path service call failed")
                 return None
-            
+
             fraction = float(future.result().fraction)
             if fraction < 0.95:  # 如果完成度低于95%，认为失败
                 # self.get_logger().warn(f"Cartesian path incomplete: {fraction*100:.1f}%")
@@ -692,14 +747,14 @@ class XArmGraspExecutor(Node):
             if future.result().error_code.val != MoveItErrorCodes.SUCCESS:
                 # self.get_logger().error(f"Cartesian path planning failed: {response.error_code.val}")
                 return None
-            
+
             final_state = self.extract_final_joint_state(future.result().solution)
             if final_state is None:
                 # self.get_logger().error("Failed to extract final joint state from Cartesian path result")
                 return None
             # self.get_logger().info(f"Cartesian path planned: {fraction*100:.1f}% complete")
             return (future.result().solution, final_state)
-            
+
         except Exception as e:
             self.get_logger().error(f"Cartesian path planning error: {e}")
             return None
@@ -750,14 +805,14 @@ class XArmGraspExecutor(Node):
         }
         current_state = start_joint_state
 
-        
+
         # 计算预抓取点
         rot = R.from_euler("xyz", list(adjusted_grasp_pose), degrees=False)
         approach_vec = rot.apply(self.pregrasp_approach_axis)
         pregrasp_center = np.array(center) + np.array(approach_vec) * self.pregrasp_offset
         pregrasp_pose = adjusted_grasp_pose
         result_dict["pregrasp_center"] = list(pregrasp_center)
-        
+
         pregrasp_goal = self.build_goal(
             xyz=pregrasp_center,
             rpy=pregrasp_pose,
@@ -824,7 +879,7 @@ class XArmGraspExecutor(Node):
             }.get(error_code, f"UNKNOWN({error_code})")
             self.get_logger().warn(f"Planning failed for candidate {aff.get('id', '?')}: {error_code_name}")
             return None
-        
+
         result_dict["pregrasp_trajectory"] = result_future.result().result.planned_trajectory
         current_state = self.extract_final_joint_state(result_future.result().result.planned_trajectory)
         if current_state is None:
@@ -837,7 +892,7 @@ class XArmGraspExecutor(Node):
             qx, qy, qz, qw = R.from_euler("xyz", adjusted_grasp_pose, degrees=False).as_quat()
             grasp_pose_msg.orientation = Quaternion(x=float(qx), y=float(qy), z=float(qz), w=float(qw))
             cartesian_result = self.plan_cartesian_path(waypoints=[grasp_pose_msg],start_joint_state=current_state,max_step=0.005,avoid_collisions=True)
-            
+
             if cartesian_result is None:
                 grasp_goal = self.build_goal(
                     xyz=center,
@@ -857,7 +912,7 @@ class XArmGraspExecutor(Node):
                 self.wait_for_future(result_future2, timeout_sec=320.0)
                 if result_future2.result().result.error_code.val != MoveItErrorCodes.SUCCESS:
                     return None
-                
+
                 result_dict["grasp_trajectory"] = result_future2.result().result.planned_trajectory
                 result_dict["final_joint_state"] = self.extract_final_joint_state(result_future2.result().result.planned_trajectory)
                 if result_dict["final_joint_state"] is None:
@@ -941,23 +996,25 @@ class XArmGraspExecutor(Node):
         t0 = time.perf_counter()
 
         for aff in grasp_candidates:
+            t_cand = time.perf_counter()
             r = self.plan_candidate(aff, grasp_pose=grasp_pose,use_pregrasp=use_pregrasp,
                 planner_id=planner_id,start_joint_state=start_joint_state)
             if r is not None:
+                r['candidate_planning_time'] = time.perf_counter() - t_cand
                 main_traj = r["pregrasp_trajectory"]
                 cost_info = self.trajectory_cost(main_traj)
                 r['cost'] = cost_info['cost']
                 r['cost_metrics'] = cost_info['metrics']
                 results.append(r)
-                
+
         planning_time = time.perf_counter() - t0
         self.get_logger().info(f"[Approaching] Planning complete: {len(results)}/{len(grasp_candidates)} succeeded "
                                f"in {planning_time:.2f}s")
-        
+
         if not results:
             self.get_logger().error("All candidates failed planning")
             return []
-        
+
         results.sort(key=lambda r: r['cost'])
         return results
 
@@ -976,11 +1033,18 @@ class XArmGraspExecutor(Node):
 
         result = {
             "success": False,
+            "instance_id": instance_id,
             "trajectories": {
                 "approaching": None,
                 "grasp": None,
+                "retreat": None,
                 "carrying": None,
                 "returning": None
+            },
+            "gripper_commands": {
+                "open_rad": best_candidate.get("drive_joint_rad", self.gripper_joint_max),
+                "close_rad": None,
+                "release_rad": self.gripper_joint_max
             }
         }
 
@@ -1002,11 +1066,12 @@ class XArmGraspExecutor(Node):
             self.set_gripper(best_candidate["drive_joint_rad"])
             if self.execution_mode:
                 time.sleep(0.5)
-            
+
             if self.use_pregrasp and "pregrasp_trajectory" in best_candidate:
                 if not self.execute_trajectory(best_candidate["pregrasp_trajectory"]):
                     self.get_logger().error("[Approaching] Failed")
                     return result
+
                 result["trajectories"]["approaching"] = best_candidate["pregrasp_trajectory"]
 
                 if self.execution_mode:
@@ -1024,13 +1089,14 @@ class XArmGraspExecutor(Node):
                     self.get_logger().error("[Approaching] Failed")
                     return result
                 result["trajectories"]["approaching"] = best_candidate["planned_trajectory"]
-            
+
             if self.execution_mode:
                 time.sleep(0.5)
-            
+
             # Step 2: 闭合夹爪（模拟抓取）
             close_width = max(0.0, best_candidate["gripper_width"] - gripper_close_tightness)
             close_rad = close_width / self.gripper_width_max * self.gripper_joint_max
+            result["gripper_commands"]["close_rad"] = close_rad
             self.set_gripper(close_rad)
             if self.execution_mode:
                 time.sleep(0.5)
@@ -1069,6 +1135,7 @@ class XArmGraspExecutor(Node):
                     return result
 
                 retreat_traj, current_joint_state = retreat_result
+                result["trajectories"]["retreat"] = retreat_traj
 
                 # 执行退回到预抓取点
                 if not self.execute_trajectory(retreat_traj):
@@ -1077,7 +1144,7 @@ class XArmGraspExecutor(Node):
 
                 if self.execution_mode:
                     time.sleep(0.3)
-            
+
             # 从预抓取点规划到放置点
             place_z = grasp_z + basket["size"][2] + place_clearance
             place_position = [basket["center"][0], basket["center"][1], place_z]
@@ -1229,13 +1296,85 @@ def _trajectory_to_json_safe(traj) -> Optional[Dict[str, Any]]:
         return {"info": "trajectory_data"}
 
 
+def _trajectory_to_full_json(traj) -> Optional[Dict[str, Any]]:
+    """将RobotTrajectory转换为包含完整路径点数据的JSON格式（供客户端执行）"""
+    if traj is None:
+        return None
+    jt = traj.joint_trajectory
+    return {
+        "joint_names": list(jt.joint_names),
+        "points": [{
+            "positions": list(p.positions),
+            "velocities": list(p.velocities) if p.velocities else [],
+            "accelerations": list(p.accelerations) if p.accelerations else [],
+            "time_from_start": {
+                "sec": p.time_from_start.sec,
+                "nanosec": p.time_from_start.nanosec
+            }
+        } for p in jt.points]
+    }
+
+
+def _build_execution_steps(full_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """根据完整抓取结果构建按执行顺序排列的步骤列表"""
+    steps = []
+    trajs = full_result["trajectories"]
+    gc = full_result["gripper_commands"]
+    instance_id = full_result.get("instance_id")
+
+    # 1. 从场景中移除目标物体（为接近做准备）
+    if instance_id:
+        steps.append({"action": "remove_object", "instance_id": instance_id, "label": "remove_target"})
+
+    # 2. 打开夹爪
+    steps.append({"action": "set_gripper", "position": gc["open_rad"], "label": "open_gripper"})
+
+    # 3. 接近（预抓取点）
+    if trajs.get("approaching") is not None:
+        steps.append({"action": "execute_trajectory", "trajectory": _trajectory_to_full_json(trajs["approaching"]), "label": "approaching"})
+
+    # 3. 抓取接近（预抓取→抓取点）
+    if trajs.get("grasp") is not None:
+        steps.append({"action": "execute_trajectory", "trajectory": _trajectory_to_full_json(trajs["grasp"]), "label": "grasp_approach"})
+
+    # 4. 闭合夹爪
+    if gc["close_rad"] is not None:
+        steps.append({"action": "set_gripper", "position": gc["close_rad"], "label": "close_gripper"})
+
+    # 5. 附着物体到夹爪
+    if instance_id:
+        steps.append({"action": "attach_object", "instance_id": instance_id, "label": "attach_object"})
+
+    # 6. 退回到预抓取点
+    if trajs.get("retreat") is not None:
+        steps.append({"action": "execute_trajectory", "trajectory": _trajectory_to_full_json(trajs["retreat"]), "label": "retreat"})
+
+    # 7. 搬运到放置点
+    if trajs.get("carrying") is not None:
+        steps.append({"action": "execute_trajectory", "trajectory": _trajectory_to_full_json(trajs["carrying"]), "label": "carrying"})
+
+    # 8. 释放
+    steps.append({"action": "set_gripper", "position": gc["release_rad"], "label": "release"})
+
+    # 9. 从夹爪分离物体
+    if instance_id:
+        steps.append({"action": "detach_object", "instance_id": instance_id, "label": "detach_object"})
+
+    # 10. 返回HOME
+    if trajs.get("returning") is not None:
+        steps.append({"action": "execute_trajectory", "trajectory": _trajectory_to_full_json(trajs["returning"]), "label": "returning"})
+
+    return steps
+
+
 def _execute_grasp_core(
     executor: XArmGraspExecutor,
     depth_path: str,
     seg_json_path: str,
     affordance_path: str,
     config: Dict[str, Any],
-    target_object_index: Optional[int] = None
+    target_object_index: Optional[int] = None,
+    return_full_trajectories: bool = False
 ) -> List[Dict[str, Any]]:
     """核心抓取逻辑（可被命令行和HTTP服务复用）"""
     results = []
@@ -1388,9 +1527,18 @@ def _execute_grasp_core(
                 "carrying_trajectory": _trajectory_to_json_safe(full_result["trajectories"].get("carrying")),
                 "returning_trajectory": _trajectory_to_json_safe(full_result["trajectories"].get("returning"))
             }
+            if return_full_trajectories:
+                result["execution_steps"] = _build_execution_steps(full_result)
             results.append(result)
         else:
             # 多个物体：去重并排序
+            # 先按 instance_id 汇总 approaching 阶段的规划时间
+            instance_planning_time = {}
+            for candidate in ranked_results:
+                iid = candidate["instance_id"]
+                t = candidate.get("candidate_planning_time", 0.0)
+                instance_planning_time[iid] = instance_planning_time.get(iid, 0.0) + t
+
             seen_instances = set()
             filtered_results = []
             for candidate in ranked_results:
@@ -1402,10 +1550,11 @@ def _execute_grasp_core(
             filtered_results.sort(key=lambda r: r['cost'])
 
             for rank, candidate in enumerate(filtered_results, start=1):
-                t0 = time.perf_counter()
+                iid = candidate["instance_id"]
 
                 if rank == 1:
                     # 只执行排序最好的那个
+                    t0 = time.perf_counter()
                     full_result = executor.execute_complete_grasp_sequence(
                         best_candidate=candidate,
                         basket=basket,
@@ -1413,10 +1562,12 @@ def _execute_grasp_core(
                         grasp_pose_base=grasp_pose_base,
                         home_joints=home_config.get("joints", [0.0] * 7)
                     )
+                    seq_time = time.perf_counter() - t0
 
-                    planning_time = time.perf_counter() - t0
+                    # approaching 时间 + 完整序列执行时间
+                    planning_time = instance_planning_time.get(iid, 0.0) + seq_time
                     result = {
-                        "instance_id": candidate["instance_id"],
+                        "instance_id": iid,
                         "success": full_result["success"],
                         "planning_time": planning_time,
                         "rank": rank,
@@ -1424,11 +1575,13 @@ def _execute_grasp_core(
                         "carrying_trajectory": _trajectory_to_json_safe(full_result["trajectories"].get("carrying")),
                         "returning_trajectory": _trajectory_to_json_safe(full_result["trajectories"].get("returning"))
                     }
+                    if return_full_trajectories:
+                        result["execution_steps"] = _build_execution_steps(full_result)
                 else:
-                    # 其他候选只记录规划结果
-                    planning_time = time.perf_counter() - t0
+                    # 其他候选只记录规划结果（使用 approaching 阶段汇总时间）
+                    planning_time = instance_planning_time.get(iid, 0.0)
                     result = {
-                        "instance_id": candidate["instance_id"],
+                        "instance_id": iid,
                         "success": True,
                         "planning_time": planning_time,
                         "rank": rank,
@@ -1441,14 +1594,21 @@ def _execute_grasp_core(
         executor.get_logger().info(f"Planning complete: {success_count}/{len(results)} succeeded")
 
     finally:
-        # 清理场景
-        try:
-            executor.clear_octomap()
-            executor.clear_pointcloud_obstacles()
-            executor.remove_basket_from_scene(basket["id"])
-            executor.detach_object()
-        except Exception as e:
-            executor.get_logger().warn(f"Cleanup error: {e}")
+        if return_full_trajectories:
+            # 客户端模式：场景保留，由客户端执行完毕后调用 /cleanup 清理
+            executor.get_logger().info("[Cleanup] Skipped (return_full_trajectories=True, client will cleanup)")
+        else:
+            # 清理场景（每步之间留间隔，确保 PlanningScene 更新生效）
+            try:
+                executor.detach_object()
+                time.sleep(0.3)
+                executor.clear_pointcloud_obstacles()
+                executor.remove_basket_from_scene(basket["id"])
+                executor.clear_octomap()
+                time.sleep(0.5)
+                executor.get_logger().info("[Cleanup] Scene cleanup done")
+            except Exception as e:
+                executor.get_logger().warn(f"Cleanup error: {e}")
 
     return results
 
@@ -1518,364 +1678,6 @@ def main():
 
     sys.exit(0)
 
-# ==================== HTTP服务封装 ====================
-
-# 全局变量
-executor_node = None
-ros_executor = None
-ros_thread = None
-ros_worker_thread = None
-task_queue = None  # 任务队列
-result_queue = None  # 结果队列
-app = Flask(__name__)
-
-def ros_worker():
-    """ROS2工作线程 - 处理任务队列中的规划请求"""
-    global task_queue, result_queue, executor_node
-
-    print("✓ ROS2工作线程已启动")
-
-    while True:
-        try:
-            # 从队列获取任务
-            task = task_queue.get()
-
-            if task is None:  # 退出信号
-                break
-
-            task_id = task["task_id"]
-            task_type = task["type"]
-            params = task["params"]
-
-            print(f"[Worker] 处理任务 {task_id}: {task_type}")
-
-            try:
-                if task_type == "grasp":
-                    # 执行抓取规划
-                    print(f"[Worker] 开始执行抓取任务 {task_id}")
-                    result = run_grasp_pipeline(
-                        depth_path=params["depth_path"],
-                        seg_json_path=params["seg_json_path"],
-                        affordance_path=params["affordance_path"],
-                        target_object_index=params.get("target_object_index")
-                    )
-                    print(f"[Worker] 抓取任务完成，结果: {result.get('success')}")
-                elif task_type == "update_scene":
-                    # 更新场景
-                    executor_node.scene_manager.update_scene(
-                        params["depth_path"],
-                        params["seg_json_path"]
-                    )
-                    result = {"success": True, "message": "场景更新成功"}
-                else:
-                    result = {"success": False, "message": f"未知任务类型: {task_type}"}
-
-                # 将结果放入结果队列
-                print(f"[Worker] 将结果放入队列: task_id={task_id}, success={result.get('success')}")
-                result_queue.put({"task_id": task_id, "result": result})
-                print(f"[Worker] 任务 {task_id} 完成，结果已放入队列")
-
-            except Exception as e:
-                print(f"[Worker] 任务 {task_id} 执行出错: {e}")
-                import traceback
-                traceback.print_exc()
-                result_queue.put({
-                    "task_id": task_id,
-                    "result": {"success": False, "message": f"执行出错: {str(e)}"}
-                })
-
-            finally:
-                task_queue.task_done()
-
-        except Exception as e:
-            print(f"[Worker] 工作线程错误: {e}")
-            import traceback
-            traceback.print_exc()
-
-def init_ros_service(robot_name="xarm7", execution_mode=True):
-    """初始化ROS服务（后台运行）"""
-    global executor_node, ros_executor, ros_thread, ros_worker_thread, task_queue, result_queue
-
-    if executor_node is not None:
-        return
-
-    # 加载配置
-    config_path = f"config/{robot_name}_config.json"
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-
-    rclpy.init()
-    executor_node = XArmGraspExecutor(
-        execution_mode=execution_mode,
-        camera_params=config["camera"],
-        config=config
-    )
-
-    # 启动ROS后台线程 - 使用MultiThreadedExecutor支持多线程调用
-    ros_executor = MultiThreadedExecutor(num_threads=4)
-    ros_executor.add_node(executor_node)
-
-    def ros_spin():
-        try:
-            ros_executor.spin()
-        except Exception as e:
-            print(f"ROS spin error: {e}")
-
-    ros_thread = threading.Thread(target=ros_spin, daemon=True)
-    ros_thread.start()
-
-    # 初始化任务队列
-    import queue
-    task_queue = queue.Queue()
-    result_queue = queue.Queue()
-
-    # 启动ROS2工作线程
-    ros_worker_thread = threading.Thread(target=ros_worker, daemon=True)
-    ros_worker_thread.start()
-
-    # 等待节点完全初始化
-    time.sleep(2.0)
-
-    print(f"✓ ROS服务已启动 (robot={robot_name}, execution_mode={execution_mode})")
-
-
-@app.route('/', methods=['GET'])
-def index():
-    """服务欢迎页面"""
-    return jsonify({
-        "service": "MoveIt HTTP Service",
-        "version": "1.0",
-        "robot": executor_node.planning_group if executor_node else "unknown",
-        "endpoints": {
-            "health": "GET /health - 健康检查",
-            "update_scene": "POST /update_scene - 更新场景",
-            "grasp": "POST /grasp - 执行抓取规划"
-        },
-        "status": "运行中"
-    })
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """健康检查"""
-    try:
-        if executor_node is None:
-            return jsonify({"status": "error", "message": "服务未初始化"}), 503
-        return jsonify({"status": "healthy", "robot": executor_node.planning_group})
-    except Exception as e:
-        print(f"Health check error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/update_scene', methods=['POST'])
-def update_scene():
-    """更新场景（添加碰撞物体）"""
-    global executor_node, task_queue, result_queue
-
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
-
-    try:
-        data = request.get_json()
-        depth_path = data.get("depth_path")
-        seg_json_path = data.get("seg_json_path")
-
-        if not all([depth_path, seg_json_path]):
-            return jsonify({"success": False, "message": "缺少必要参数: depth_path, seg_json_path"}), 400
-
-        # 生成任务ID
-        import uuid
-        task_id = str(uuid.uuid4())
-
-        # 提交任务到队列
-        task = {
-            "task_id": task_id,
-            "type": "update_scene",
-            "params": {
-                "depth_path": depth_path,
-                "seg_json_path": seg_json_path
-            }
-        }
-        task_queue.put(task)
-
-        # 等待结果
-        timeout = 30  # 30秒
-        start_time = time.time()
-        while True:
-            try:
-                result_item = result_queue.get(timeout=1)
-                if result_item["task_id"] == task_id:
-                    return jsonify(result_item["result"])
-                else:
-                    result_queue.put(result_item)
-            except:
-                pass
-
-            if time.time() - start_time > timeout:
-                return jsonify({"success": False, "message": "任务超时"}), 504
-
-    except Exception as e:
-        return jsonify({"success": False, "message": f"更新场景失败: {str(e)}"}), 500
-
-
-@app.route('/grasp', methods=['POST'])
-def execute_grasp():
-    """执行抓取任务"""
-    global executor_node, task_queue, result_queue
-
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
-
-    try:
-        data = request.get_json()
-        depth_path = data.get("depth_path")
-        seg_json_path = data.get("seg_json_path")
-        affordance_path = data.get("affordance_path")
-        target_object_index = data.get("target_object_index")
-        plan_only = data.get("plan_only", False)  # 默认执行，设为True则只规划
-
-        if not all([depth_path, seg_json_path, affordance_path]):
-            return jsonify({"success": False, "message": "缺少必要参数: depth_path, seg_json_path, affordance_path"}), 400
-
-        # 临时切换执行模式
-        original_mode = executor_node.execution_mode
-        if plan_only:
-            executor_node.execution_mode = False
-
-        try:
-            # 生成任务ID
-            import uuid
-            task_id = str(uuid.uuid4())
-
-            # 提交任务到队列
-            task = {
-                "task_id": task_id,
-                "type": "grasp",
-                "params": {
-                    "depth_path": depth_path,
-                    "seg_json_path": seg_json_path,
-                    "affordance_path": affordance_path,
-                    "target_object_index": target_object_index
-                }
-            }
-            task_queue.put(task)
-
-            # 等待结果（最多30分钟 - 考虑多个候选点的规划）
-            timeout = 1800  # 30分钟
-            start_time = time.time()
-            print(f"[Flask] 等待任务 {task_id} 的结果...")
-            while True:
-                try:
-                    result_item = result_queue.get(timeout=1)
-                    print(f"[Flask] 收到结果，task_id={result_item.get('task_id')}")
-                    if result_item["task_id"] == task_id:
-                        print(f"[Flask] 匹配成功，返回结果: {result_item['result'].get('success')}")
-                        return jsonify(result_item["result"])
-                    else:
-                        # 不是我们的结果，放回队列
-                        print(f"[Flask] task_id不匹配，放回队列")
-                        result_queue.put(result_item)
-                except Exception as e:
-                    # 队列为空或超时，继续等待
-                    if "Empty" not in str(type(e)):
-                        print(f"[Flask] 等待结果时出错: {e}")
-
-                if time.time() - start_time > timeout:
-                    print(f"[Flask] 任务 {task_id} 超时")
-                    return jsonify({"success": False, "message": "任务超时"}), 504
-
-        finally:
-            executor_node.execution_mode = original_mode
-
-    except Exception as e:
-        return jsonify({"success": False, "message": f"执行失败: {str(e)}"}), 500
-
-
-def run_grasp_pipeline(depth_path, seg_json_path, affordance_path, target_object_index=None):
-    """执行完整的抓取流程（HTTP服务模式）"""
-    global executor_node
-
-    if executor_node is None:
-        return {"success": False, "message": "服务未初始化"}
-
-    # 使用executor_node中已经加载的配置
-    config = executor_node.config
-
-    try:
-        # 调用核心逻辑
-        results = _execute_grasp_core(
-            executor=executor_node,
-            depth_path=depth_path,
-            seg_json_path=seg_json_path,
-            affordance_path=affordance_path,
-            config=config,
-            target_object_index=target_object_index
-        )
-
-        if results and results[0]["success"]:
-            return {
-                "success": True,
-                "message": "抓取任务完成",
-                "results": results
-            }
-        else:
-            return {"success": False, "message": "抓取执行失败"}
-
-    except Exception as e:
-        executor_node.get_logger().error(f"Pipeline error: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"success": False, "message": f"执行出错: {str(e)}"}
-
-
-def start_service(host="0.0.0.0", port=8000, robot_name="xarm7", execution_mode=True):
-    """启动HTTP服务"""
-    import socket
-
-    init_ros_service(robot_name=robot_name, execution_mode=execution_mode)
-
-    # 检测端口是否可用，不可用则自动递增
-    actual_port = port
-    for offset in range(10):
-        actual_port = port + offset
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind((host, actual_port))
-                break
-            except OSError:
-                if offset == 0:
-                    print(f"  端口 {actual_port} 被占用，尝试其他端口...")
-    else:
-        print(f"  端口 {port}-{port+9} 全部被占用，启动失败")
-        return
-
-    if actual_port != port:
-        print(f"  原端口 {port} 被占用，改用端口 {actual_port}")
-
-    print(f"✓ HTTP服务启动在 http://{host}:{actual_port}")
-    print(f"  - 健康检查: GET  http://{host}:{actual_port}/health")
-    print(f"  - 执行抓取: POST http://{host}:{actual_port}/grasp")
-    app.run(host=host, port=actual_port, debug=False, threaded=True)
-
 
 if __name__ == "__main__":
-    import sys
-    
-    # 检查是否以服务模式运行
-    if len(sys.argv) > 1 and sys.argv[1] == "service":
-        # 服务模式：python test_moveit.py service [port] [robot_name]
-        port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
-        robot_name = sys.argv[3] if len(sys.argv) > 3 else "xarm7"
-        execution_mode = True  # 默认执行模式
-        
-        print(f"启动MoveIt服务模式...")
-        print(f"  机械臂: {robot_name}")
-        print(f"  端口: {port}")
-        print(f"  执行模式: {execution_mode}")
-        
-        start_service(port=port, robot_name=robot_name, execution_mode=execution_mode)
-    else:
-        # 原始main函数模式
-        main()
+    main()
