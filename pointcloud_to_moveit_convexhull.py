@@ -18,6 +18,7 @@ from moveit_msgs.srv import ApplyPlanningScene
 from moveit_msgs.msg import PlanningScene, CollisionObject
 from shape_msgs.msg import Mesh, MeshTriangle
 from geometry_msgs.msg import Pose
+from octomap_msgs.msg import Octomap
 
 
 def rle_fr_string(counts_str: str):
@@ -126,6 +127,7 @@ class SceneManager:
         self.disabled_instance_ids = set()
         self.processed_meshes: dict[str, Mesh] = {}
         self.last_table_z: float | None = None
+        self.octomap_received = False
 
         # ROS2 发布器
         cloud_qos = QoSProfile(
@@ -137,15 +139,34 @@ class SceneManager:
         self.topic = "/camera/depth/color/points"
         self.pub = self.node.create_publisher(PointCloud2, self.topic, cloud_qos)
 
+        # Octomap -> PlanningScene 桥接
+        self.scene_pub = self.node.create_publisher(PlanningScene, '/planning_scene', 10)
+        self.octomap_sub = self.node.create_subscription(
+            Octomap,
+            '/octomap_binary',
+            self.octomap_callback,
+            10
+        )
+
         # ROS2 服务客户端
         self._clear_cli = self.node.create_client(Empty, "/clear_octomap")
         self._apply_scene_cli = self.node.create_client(ApplyPlanningScene, "/apply_planning_scene")
 
     def update_scene(self, depth_path: str, seg_json_path: str):
-        # 1. 清除OctoMap
+        # 1. 清除OctoMap（同步等待完成）
         if self._clear_cli.wait_for_service(timeout_sec=2.0):
             try:
-                self._clear_cli.call_async(Empty.Request())
+                future = self._clear_cli.call_async(Empty.Request())
+                # 等待 clear 完成
+                timeout_sec = 5.0
+                start = self.node.get_clock().now()
+                while not future.done():
+                    rclpy.spin_once(self.node, timeout_sec=0.1)
+                    elapsed = (self.node.get_clock().now() - start).nanoseconds / 1e9
+                    if elapsed > timeout_sec:
+                        self.node.get_logger().warn("Timeout waiting for /clear_octomap to complete")
+                        break
+                self.node.get_logger().info("✓ OctoMap cleared")
             except Exception as e:
                 self.node.get_logger().error(f"Failed to clear OctoMap: {e}")
         else:
@@ -171,31 +192,37 @@ class SceneManager:
             full_masks.append(m)
             inst_ids.append(inst["id"])
 
-        # 5. 构建背景点云mask
+        # 5. 构建背景点云mask（膨胀物体mask，排除凸包边缘区域）
         if full_masks:
             union_mask = np.logical_or.reduce(full_masks)
-            bg_mask = ~union_mask
-            coverage_ratio = union_mask.sum() / union_mask.size
-            # self.node.get_logger().info(f"Object mask coverage: {coverage_ratio*100:.1f}%")
+            dilate_kernel = np.ones((100, 100), np.uint8)
+            union_mask_dilated = cv2.dilate(union_mask.astype(np.uint8), dilate_kernel, iterations=3).astype(bool)
+            bg_mask = ~union_mask_dilated
+            self.node.get_logger().info(
+                f"[DEBUG] union_mask pixels: {union_mask.sum()}, "
+                f"dilated pixels: {union_mask_dilated.sum()}, "
+                f"bg_mask pixels: {bg_mask.sum()}, "
+                f"total pixels: {union_mask.size}"
+            )
         else:
             bg_mask = np.ones_like(z_m, dtype=bool)
         pts_bg = self._build_points(z_m, bg_mask)
-        # self.node.get_logger().info(f"Background points generated: {pts_bg.shape[0]}")
+        self.node.get_logger().info(f"Background points generated: {pts_bg.shape[0]}")
 
         # 6. 估计背景z
-        base_z = None
+        base_z = 0.015
         try:
             base_z = self._estimate_base_z_from_bg(pts_bg)
         except Exception as e:
             self.node.get_logger().warn(f"Base z estimation failed: {e}")
 
         if base_z is not None:
-            table_filter_margin = 0.01
+            table_filter_margin = 0.0005
         else:
             table_filter_margin = None
 
         # 7. 先为每个启用的实例生成凸包
-        k = 7 if self.stride <= 2 else 5
+        k = 5 if self.stride <= 2 else 3
         kernel = np.ones((k, k), np.uint8)
 
         meshes: list[tuple[str, Mesh]] = []
@@ -216,9 +243,6 @@ class SceneManager:
                 pts_obj = pts_obj[pts_obj[:, 2] > (base_z + table_filter_margin)]
 
             pts_after_filter = pts_obj.shape[0]
-            self.node.get_logger().info(
-                f"[MESH] {inst_id}: points before={pts_before_filter}, after_filter={pts_after_filter}, base_z={base_z:.3f if base_z else 'None'}"
-            )
 
             mesh = self._mesh_from_convex_hull(pts_obj)
             if mesh is None:
@@ -240,22 +264,47 @@ class SceneManager:
         if pts_bg.shape[0] == 0:
             self.node.get_logger().warn("Background pointcloud is EMPTY! OctoMap will not update.")
         else:
-            # 检查订阅者数量
-            sub_count = self.pub.get_subscription_count()
-            self.node.get_logger().info(f"Point cloud topic has {sub_count} subscriber(s)")
+            # 等待订阅者就绪
+            self.node.get_logger().info(f"Waiting for OctoMap monitor to subscribe to {self.topic}...")
+            timeout = 10.0  # 10秒超时
+            start_time = self.node.get_clock().now()
 
-            if sub_count == 0:
-                self.node.get_logger().warn("⚠ No subscribers for point cloud! OctoMap monitor may not be running.")
-            else:
-                self.node.get_logger().info(f"✓ OctoMap monitor is active and subscribing to point cloud")
+            while True:
+                sub_count = self.pub.get_subscription_count()
+                if sub_count > 0:
+                    self.node.get_logger().info(f"✓ OctoMap monitor is ready ({sub_count} subscriber(s))")
+                    break
 
-            # 发布点云（无论是否有订阅者，为将来的 monitor 准备）
+                elapsed = (self.node.get_clock().now() - start_time).nanoseconds / 1e9
+                if elapsed > timeout:
+                    self.node.get_logger().error(f"⚠ Timeout waiting for subscribers! OctoMap monitor may not be running.")
+                    self.node.get_logger().error(f"   Please ensure OctoMap monitor is started and subscribing to {self.topic}")
+                    return
+
+                self.node.get_logger().info(f"Waiting for subscribers... ({elapsed:.1f}s)")
+                rclpy.spin_once(self.node, timeout_sec=0.5)
+
+            # 发布点云（增加次数和间隔，确保 octomap 充分消费）
             self.node.get_logger().info(f"Publishing background cloud: {pts_bg.shape[0]} points to {self.topic} in frame {self.frame_id}")
-            for i in range(30):
+            for i in range(20):
                 self._publish_pointcloud(pts_bg)
                 rclpy.spin_once(self.node, timeout_sec=0.0)
-                self.node.get_clock().sleep_for(rclpy.duration.Duration(seconds=0.05))
-            self.node.get_logger().info(f"✓ Finished publishing background cloud (30 times over 1.5s)")
+                self.node.get_clock().sleep_for(rclpy.duration.Duration(seconds=0.1))
+            self.node.get_logger().info(f"✓ Finished publishing background cloud (20 times over 2s)")
+
+            # 等待 octomap 回调被触发
+            self.octomap_received = False
+            self.node.get_logger().info("Waiting for octomap response...")
+            wait_start = self.node.get_clock().now()
+            wait_timeout = 15.0
+            while not self.octomap_received:
+                rclpy.spin_once(self.node, timeout_sec=0.1)
+                elapsed = (self.node.get_clock().now() - wait_start).nanoseconds / 1e9
+                if elapsed > wait_timeout:
+                    self.node.get_logger().error(f"Timeout waiting for octomap response after {wait_timeout}s")
+                    break
+            if self.octomap_received:
+                self.node.get_logger().info("✓ Octomap received and published to planning scene")
 
     def remove_instance_hull(self, instance_id: str):
         """移除目标物品凸包"""
@@ -275,6 +324,19 @@ class SceneManager:
         req = ApplyPlanningScene.Request()
         req.scene = scene
         self._apply_scene_cli.call_async(req)
+
+    def octomap_callback(self, octomap_msg):
+        """接收octomap并转发到planning scene"""
+        self.node.get_logger().info(f'Received octomap: {len(octomap_msg.data)} bytes')
+
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.world.octomap.header = octomap_msg.header
+        scene.world.octomap.octomap = octomap_msg
+
+        self.scene_pub.publish(scene)
+        self.octomap_received = True
+        self.node.get_logger().info('Published octomap to planning scene')
 
     def _load_instances(self, seg_json_path: str, score_thresh: float):
         """加载分割结果JSON"""
@@ -441,8 +503,8 @@ def example_with_config():
     # 创建SceneManager，传入父节点
     scene_mgr = SceneManager(node=parent_node, config=config)
 
-    depth_path = "test_data/grasp-wrist-dpt_opt.png"
-    seg_json_path = "test_data/rgb_detection_wrist"
+    depth_path = "data/3DGrasp-BMv1/grasp-wrist-dpt_opt.png"
+    seg_json_path = "test_data/rgb_detection_wrist.json"
 
     scene_mgr.update_scene(depth_path=depth_path, seg_json_path=seg_json_path)
 

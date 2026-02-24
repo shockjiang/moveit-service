@@ -52,7 +52,7 @@ def load_res(dataset_dir):
 
     flange_to_tool = np.asarray(cfg["robot"]["flange_to_tool_translation_m"], dtype=np.float64)
 
-    end_pose_mm_deg[2] += 100
+    end_pose_mm_deg[2] += 200
     wrist_base = wrist_cam_to_base(
         pc_cam,
         end_pose_mm_deg,

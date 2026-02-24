@@ -26,8 +26,8 @@ octo-server:
 	source set-env.sh
 	ros2 run octomap_server octomap_server_node --ros-args \
 		-p frame_id:=world \
-		-p resolution:=0.001 \
-		-r cloud_in:=/scene_cloud
+		-p resolution:=0.005 \
+		-r cloud_in:=/camera/depth/color/points
 
 
 # 	xvfb-run ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false 2 > log/moveit.log & tail -f log/moveit.log

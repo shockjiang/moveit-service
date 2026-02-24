@@ -22,6 +22,6 @@ if [[ ":$PATH:" != ":/usr/bin:"* ]]; then
 fi
 
 pip3 install -r requirements.txt --break-system-packages --user --ignore-installed
-apt update
-apt install ros-jazzy-moveit-ros-perception ros-jazzy-octomap-rviz-plugins
+apt-get update && apt-get install -y ros-jazzy-moveit-ros-perception ros-jazzy-octomap-rviz-plugins ros-jazzy-octomap-server
+
 
