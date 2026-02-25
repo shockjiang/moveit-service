@@ -9,7 +9,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 
-from geometry_msgs.msg import PoseStamped, Point, Pose,Quaternion
+from geometry_msgs.msg import PoseStamped, Point, Pose, Quaternion
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectoryPoint
 
@@ -26,8 +26,10 @@ from moveit_msgs.msg import (
     CollisionObject,
     AttachedCollisionObject,
     PlanningScene,
-    RobotState
+    RobotState,
+    ObjectColor
 )
+from std_msgs.msg import ColorRGBA
 from moveit_msgs.srv import GetCartesianPath
 from shape_msgs.msg import SolidPrimitive, Mesh
 from scipy.spatial.transform import Rotation as R
@@ -111,6 +113,90 @@ class XArmGraspExecutor(Node):
         while not future.done() and (time.time() - start_time) < timeout_sec:
             self._spin_wait(0.1)
         return future.done()
+
+    def add_workspace_walls(self):
+        """在工作空间边界添加碰撞墙壁，强制规划器不超出范围"""
+        ws = self.workspace_limits
+        x_min, x_max = ws["x"]
+        y_min, y_max = ws["y"]
+        z_min, z_max = ws["z"]
+
+        # 墙壁厚度和向外扩展的尺寸
+        t = 0.02  # 2cm 厚
+        # 每面墙的范围要覆盖得比工作空间大一些，避免边角漏洞
+        pad = 1.0
+
+        walls = []
+
+        # +X 墙 (前方)
+        walls.append(self._make_box_collision_object(
+            "ws_wall_x_pos",
+            center=(x_max + t / 2, (y_min + y_max) / 2, (z_min + z_max) / 2),
+            size=(t, y_max - y_min + pad, z_max - z_min + pad),
+        ))
+        # -X 墙 (后方)
+        walls.append(self._make_box_collision_object(
+            "ws_wall_x_neg",
+            center=(x_min - t / 2, (y_min + y_max) / 2, (z_min + z_max) / 2),
+            size=(t, y_max - y_min + pad, z_max - z_min + pad),
+        ))
+        # +Y 墙 (左侧)
+        walls.append(self._make_box_collision_object(
+            "ws_wall_y_pos",
+            center=((x_min + x_max) / 2, y_max + t / 2, (z_min + z_max) / 2),
+            size=(x_max - x_min + pad, t, z_max - z_min + pad),
+        ))
+        # -Y 墙 (右侧)
+        walls.append(self._make_box_collision_object(
+            "ws_wall_y_neg",
+            center=((x_min + x_max) / 2, y_min - t / 2, (z_min + z_max) / 2),
+            size=(x_max - x_min + pad, t, z_max - z_min + pad),
+        ))
+        # +Z 墙 (顶部)
+        walls.append(self._make_box_collision_object(
+            "ws_wall_z_pos",
+            center=((x_min + x_max) / 2, (y_min + y_max) / 2, z_max + t / 2),
+            size=(x_max - x_min + pad, y_max - y_min + pad, t),
+        ))
+        # -Z 墙 (底部/地面)
+        walls.append(self._make_box_collision_object(
+            "ws_wall_z_neg",
+            center=((x_min + x_max) / 2, (y_min + y_max) / 2, z_min - t / 2),
+            size=(x_max - x_min + pad, y_max - y_min + pad, t),
+        ))
+
+        # 一次性发布所有墙壁（透明，RViz中不可见，但碰撞检测仍生效）
+        ps = PlanningScene()
+        ps.is_diff = True
+        for wall in walls:
+            ps.world.collision_objects.append(wall)
+            oc = ObjectColor()
+            oc.id = wall.id
+            oc.color = ColorRGBA(r=0.0, g=0.0, b=0.0, a=0.0)
+            ps.object_colors.append(oc)
+        self.scene_pub.publish(ps)
+
+        self.get_logger().info(
+            f"[Workspace] Added 6 walls: "
+            f"x=[{x_min}, {x_max}], y=[{y_min}, {y_max}], z=[{z_min}, {z_max}]"
+        )
+
+    def remove_workspace_walls(self):
+        """移除工作空间碰撞墙壁"""
+        wall_ids = [
+            "ws_wall_x_pos", "ws_wall_x_neg",
+            "ws_wall_y_pos", "ws_wall_y_neg",
+            "ws_wall_z_pos", "ws_wall_z_neg",
+        ]
+        ps = PlanningScene()
+        ps.is_diff = True
+        for wid in wall_ids:
+            co = CollisionObject()
+            co.id = wid
+            co.operation = CollisionObject.REMOVE
+            ps.world.collision_objects.append(co)
+        self.scene_pub.publish(ps)
+        self.get_logger().info("[Workspace] Removed workspace walls")
 
     def init_scene_manager(self):
         try:
@@ -395,7 +481,7 @@ class XArmGraspExecutor(Node):
             self.get_logger().error(f"Failed to clear OctoMap: {e}")
 
     def clear_pointcloud_obstacles(self):
-        """清除所有点云凸包障碍物（打包为一次 ApplyPlanningScene 调用）"""
+        """清除所有点云凸包障碍物（通过 topic 发布，兼容 Flask 线程调用）"""
         if self.scene_manager is None:
             return
         try:
@@ -407,22 +493,16 @@ class XArmGraspExecutor(Node):
             for inst_id in ids_to_remove:
                 self.scene_manager.disabled_instance_ids.add(inst_id)
 
-            # 一次性批量移除
-            if self.scene_manager._apply_scene_cli.wait_for_service(timeout_sec=3.0):
-                scene = PlanningScene()
-                scene.is_diff = True
-                for inst_id in ids_to_remove:
-                    co = CollisionObject()
-                    co.id = inst_id
-                    co.header.frame_id = self.scene_manager.frame_id
-                    co.operation = CollisionObject.REMOVE
-                    scene.world.collision_objects.append(co)
-
-                from moveit_msgs.srv import ApplyPlanningScene
-                req = ApplyPlanningScene.Request()
-                req.scene = scene
-                future = self.scene_manager._apply_scene_cli.call_async(req)
-                self.wait_for_future(future, timeout_sec=5.0)
+            # 通过 topic 一次性批量移除（与 remove_object_from_scene / remove_basket_from_scene 一致）
+            ps = PlanningScene()
+            ps.is_diff = True
+            for inst_id in ids_to_remove:
+                co = CollisionObject()
+                co.id = inst_id
+                co.header.frame_id = self.scene_manager.frame_id
+                co.operation = CollisionObject.REMOVE
+                ps.world.collision_objects.append(co)
+            self.scene_pub.publish(ps)
 
             # 清空disabled标记，让下一次 update_scene 可以正常重建凸包
             self.scene_manager.disabled_instance_ids.clear()
@@ -544,6 +624,9 @@ class XArmGraspExecutor(Node):
 
         # 清空点云障碍物
         self.clear_pointcloud_obstacles()
+
+        # 移除工作空间墙壁
+        self.remove_workspace_walls()
 
         self.get_logger().info("[Scene] Planning scene reset complete")
 
@@ -1462,6 +1545,11 @@ def _execute_grasp_core(
             raise RuntimeError("Scene manager failed to initialize")
         executor.scene_manager.update_scene(depth_path, seg_json_path)
         time.sleep(1.0)
+
+        # Step 3.5: 添加工作空间碰撞墙壁
+        executor.get_logger().info("=== Step 3.5: Adding workspace walls ===")
+        executor.add_workspace_walls()
+        time.sleep(0.5)
 
         # Step 4: 添加终点框
         executor.get_logger().info("=== Step 4: Adding target basket ===")

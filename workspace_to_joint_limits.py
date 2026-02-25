@@ -4,18 +4,22 @@
 
 使用方法:
     python3 workspace_to_joint_limits.py
+    python3 workspace_to_joint_limits.py --config config/xarm7_config.json
+    python3 workspace_to_joint_limits.py --cone-angle 45 --num-samples 3000
 
 功能:
-1. 在指定的末端工作空间中采样
-2. 对每个采样点求解 IK，收集所有可行的关节配置
-3. 统计分析关节角度分布
-4. 生成推荐的关节限制
-5. 验证限制后是否会丢解
+1. 从 config JSON 读取 workspace_limits 和 home 姿态
+2. 在 workspace box 内采样位置，在 home 姿态的圆锥内采样朝向
+3. 对每个采样点求解 IK，收集所有可行的关节配置
+4. 统计分析关节角度分布，生成推荐的关节限制
 """
 
+import argparse
 import numpy as np
 import json
 from typing import List, Dict, Tuple, Optional
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
@@ -26,7 +30,7 @@ from moveit_msgs.srv import GetPositionIK
 from moveit_msgs.msg import PositionIKRequest, RobotState
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped, Pose
-import tf_transformations
+from scipy.spatial.transform import Rotation as R
 
 
 class WorkspaceAnalyzer(Node):
@@ -36,152 +40,126 @@ class WorkspaceAnalyzer(Node):
         super().__init__('workspace_analyzer')
 
         # IK 服务客户端
-        self.ik_client = self.create_client(
-            GetPositionIK,
-            '/compute_ik'
-        )
+        self.ik_client = self.create_client(GetPositionIK, '/compute_ik')
 
-        # 等待服务
         self.get_logger().info("Waiting for IK service...")
         self.ik_client.wait_for_service(timeout_sec=10.0)
         self.get_logger().info("IK service ready!")
 
-        # 关节名称
         self.joint_names = [
             'joint1', 'joint2', 'joint3', 'joint4',
             'joint5', 'joint6', 'joint7'
         ]
 
-        # 存储采样结果
-        self.sampled_poses = []  # 采样的末端位姿
-        self.ik_solutions = []   # 所有 IK 解
-        self.failed_poses = []   # 无解的位姿
+        self.sampled_poses = []
+        self.ik_solutions = []
+        self.failed_poses = []
 
-    def sample_workspace(
+    # ── 采样 ─────────────────────────────────────────────────────
+
+    def sample_workspace_cone(
         self,
         x_range: Tuple[float, float],
         y_range: Tuple[float, float],
         z_range: Tuple[float, float],
-        num_samples: int = 1000,
-        orientations: Optional[List[Tuple[float, float, float]]] = None
+        home_rpy: Tuple[float, float, float],
+        cone_half_angle_deg: float = 30.0,
+        num_samples: int = 2000,
     ) -> List[Pose]:
         """
-        在工作空间中采样
+        在 workspace box 内采样位置，在 home 姿态的圆锥内采样朝向。
+
+        圆锥定义: 末端 z 轴与 home z 轴的夹角 ≤ cone_half_angle_deg。
+        圆锥内采用均匀立体角采样，同时对 roll 角均匀采样。
 
         Args:
-            x_range: (x_min, x_max) 单位: 米
-            y_range: (y_min, y_max) 单位: 米
-            z_range: (z_min, z_max) 单位: 米
-            num_samples: 采样点数量
-            orientations: 姿态列表 [(roll, pitch, yaw), ...], 如果为 None 则使用默认姿态
-
-        Returns:
-            采样的位姿列表
+            x/y/z_range: 工作空间 box
+            home_rpy: home 姿态的 (roll, pitch, yaw)，单位弧度
+            cone_half_angle_deg: 圆锥半角（度）
+            num_samples: 采样数量
         """
-        self.get_logger().info(f"Sampling workspace: x={x_range}, y={y_range}, z={z_range}")
+        self.get_logger().info(
+            f"Sampling: box x={x_range} y={y_range} z={z_range}, "
+            f"cone={cone_half_angle_deg*2:.0f}° around home_rpy={[f'{v:.3f}' for v in home_rpy]}"
+        )
         self.get_logger().info(f"Number of samples: {num_samples}")
 
+        R_home = R.from_euler('xyz', home_rpy)
+        half_angle = np.radians(cone_half_angle_deg)
+        cos_half = np.cos(half_angle)
+
         poses = []
+        for _ in range(num_samples):
+            # 位置：box 内均匀采样
+            x = np.random.uniform(x_range[0], x_range[1])
+            y = np.random.uniform(y_range[0], y_range[1])
+            z = np.random.uniform(z_range[0], z_range[1])
 
-        # 默认姿态: 向下
-        if orientations is None:
-            orientations = [
-                (-np.pi, 0.0, 0.0),  # 向下
-                (-np.pi, 0.0, np.pi/4),  # 向下 + 旋转 45°
-                (-np.pi, 0.0, -np.pi/4),  # 向下 + 旋转 -45°
-                (-np.pi, 0.0, np.pi/2),  # 向下 + 旋转 90°
-            ]
+            # 姿态：圆锥内均匀立体角采样
+            # cos(theta) 均匀分布在 [cos(half_angle), 1]  =>  theta ∈ [0, half_angle]
+            cos_theta = np.random.uniform(cos_half, 1.0)
+            theta = np.arccos(cos_theta)       # 倾斜角
+            phi = np.random.uniform(0, 2 * np.pi)  # 倾斜方向
+            psi = np.random.uniform(-np.pi, np.pi)  # roll
 
-        # 在空间中均匀采样
-        samples_per_orientation = num_samples // len(orientations)
+            # 构建局部扰动旋转
+            # 1. tilt: 绕垂直于 z 轴的方向旋转 theta
+            tilt_axis = np.array([-np.sin(phi), np.cos(phi), 0.0])
+            R_tilt = R.from_rotvec(theta * tilt_axis)
+            # 2. roll: 绕 z 轴旋转 psi
+            R_roll = R.from_rotvec(psi * np.array([0.0, 0.0, 1.0]))
 
-        for rpy in orientations:
-            for _ in range(samples_per_orientation):
-                # 随机采样位置
-                x = np.random.uniform(x_range[0], x_range[1])
-                y = np.random.uniform(y_range[0], y_range[1])
-                z = np.random.uniform(z_range[0], z_range[1])
+            R_final = R_home * R_tilt * R_roll
+            q = R_final.as_quat()  # [x, y, z, w]
 
-                # 创建位姿
-                pose = Pose()
-                pose.position.x = x
-                pose.position.y = y
-                pose.position.z = z
-
-                # 设置姿态
-                q = tf_transformations.quaternion_from_euler(rpy[0], rpy[1], rpy[2])
-                pose.orientation.x = q[0]
-                pose.orientation.y = q[1]
-                pose.orientation.z = q[2]
-                pose.orientation.w = q[3]
-
-                poses.append(pose)
+            pose = Pose()
+            pose.position.x = x
+            pose.position.y = y
+            pose.position.z = z
+            pose.orientation.x = q[0]
+            pose.orientation.y = q[1]
+            pose.orientation.z = q[2]
+            pose.orientation.w = q[3]
+            poses.append(pose)
 
         self.sampled_poses = poses
         return poses
 
+    # ── IK ────────────────────────────────────────────────────────
+
     def solve_ik(self, pose: Pose, timeout: float = 0.1) -> Optional[List[float]]:
-        """
-        求解单个位姿的 IK
-
-        Args:
-            pose: 目标位姿
-            timeout: 超时时间（秒）
-
-        Returns:
-            关节角度列表，如果无解返回 None
-        """
-        # 创建 IK 请求
+        """求解单个位姿的 IK"""
         request = GetPositionIK.Request()
         request.ik_request.group_name = "xarm7"
         request.ik_request.avoid_collisions = True
         request.ik_request.timeout.sec = 0
         request.ik_request.timeout.nanosec = int(timeout * 1e9)
 
-        # 设置目标位姿
         pose_stamped = PoseStamped()
         pose_stamped.header.frame_id = "link_base"
         pose_stamped.pose = pose
         request.ik_request.pose_stamped = pose_stamped
 
-        # 调用服务
         future = self.ik_client.call_async(request)
         rclpy.spin_until_future_complete(self, future, timeout_sec=timeout + 0.5)
 
         if future.result() is not None:
             response = future.result()
             if response.error_code.val == 1:  # SUCCESS
-                # 提取关节角度
                 joint_state = response.solution.joint_state
                 joint_positions = []
                 for joint_name in self.joint_names:
                     if joint_name in joint_state.name:
                         idx = joint_state.name.index(joint_name)
                         joint_positions.append(joint_state.position[idx])
-
                 if len(joint_positions) == 7:
                     return joint_positions
-
         return None
 
-    def analyze_workspace(
-        self,
-        x_range: Tuple[float, float],
-        y_range: Tuple[float, float],
-        z_range: Tuple[float, float],
-        num_samples: int = 1000,
-        orientations: Optional[List[Tuple[float, float, float]]] = None
-    ) -> Dict:
-        """
-        分析工作空间并收集 IK 解
+    # ── 分析 ──────────────────────────────────────────────────────
 
-        Returns:
-            分析结果字典
-        """
-        # 采样工作空间
-        poses = self.sample_workspace(x_range, y_range, z_range, num_samples, orientations)
-
-        # 求解 IK
+    def analyze(self, poses: List[Pose]) -> Optional[Dict]:
+        """对已采样的 poses 批量求解 IK 并统计"""
         self.get_logger().info(f"Solving IK for {len(poses)} poses...")
         self.ik_solutions = []
         self.failed_poses = []
@@ -192,10 +170,7 @@ class WorkspaceAnalyzer(Node):
 
             solution = self.solve_ik(pose)
             if solution is not None:
-                self.ik_solutions.append({
-                    'pose': pose,
-                    'joints': solution
-                })
+                self.ik_solutions.append({'pose': pose, 'joints': solution})
             else:
                 self.failed_poses.append(pose)
 
@@ -204,390 +179,291 @@ class WorkspaceAnalyzer(Node):
         self.get_logger().info(f"Successful: {len(self.ik_solutions)}")
         self.get_logger().info(f"Failed: {len(self.failed_poses)}")
 
-        # 统计分析
         if len(self.ik_solutions) == 0:
             self.get_logger().error("No IK solutions found!")
             return None
 
-        # 提取所有关节角度
         all_joints = np.array([sol['joints'] for sol in self.ik_solutions])
 
-        # 计算统计信息
         joint_stats = {}
-        for i, joint_name in enumerate(self.joint_names):
-            joint_angles = all_joints[:, i]
-            joint_stats[joint_name] = {
-                'min': float(np.min(joint_angles)),
-                'max': float(np.max(joint_angles)),
-                'mean': float(np.mean(joint_angles)),
-                'std': float(np.std(joint_angles)),
-                'percentile_1': float(np.percentile(joint_angles, 1)),
-                'percentile_99': float(np.percentile(joint_angles, 99)),
-                'percentile_5': float(np.percentile(joint_angles, 5)),
-                'percentile_95': float(np.percentile(joint_angles, 95)),
+        for i, jn in enumerate(self.joint_names):
+            a = all_joints[:, i]
+            joint_stats[jn] = {
+                'min': float(np.min(a)),
+                'max': float(np.max(a)),
+                'mean': float(np.mean(a)),
+                'std': float(np.std(a)),
+                'percentile_1': float(np.percentile(a, 1)),
+                'percentile_99': float(np.percentile(a, 99)),
+                'percentile_5': float(np.percentile(a, 5)),
+                'percentile_95': float(np.percentile(a, 95)),
             }
 
-        result = {
-            'workspace': {
-                'x_range': x_range,
-                'y_range': y_range,
-                'z_range': z_range,
-                'num_samples': num_samples,
-            },
+        return {
             'ik_success_rate': success_rate,
             'num_solutions': len(self.ik_solutions),
             'num_failed': len(self.failed_poses),
             'joint_statistics': joint_stats,
         }
 
-        return result
+    # ── 关节限位生成 ──────────────────────────────────────────────
 
     def generate_joint_limits(
-        self,
-        result: Dict,
+        self, result: Dict,
         safety_margin: float = 0.1,
         use_percentile: bool = True,
         percentile: float = 99.0
     ) -> Dict[str, Tuple[float, float]]:
-        """
-        生成推荐的关节限制
-
-        Args:
-            result: analyze_workspace 的结果
-            safety_margin: 安全裕度（弧度）
-            use_percentile: 是否使用百分位数而不是绝对最小/最大值
-            percentile: 使用的百分位数（如 99 表示 1%-99%）
-
-        Returns:
-            {joint_name: (min_limit, max_limit)}
-        """
+        """生成推荐的关节限制"""
         joint_limits = {}
-
-        for joint_name, stats in result['joint_statistics'].items():
+        for jn, stats in result['joint_statistics'].items():
             if use_percentile:
-                # 使用百分位数（更保守）
-                lower_key = f'percentile_{int(100 - percentile)}'
-                upper_key = f'percentile_{int(percentile)}'
-                min_val = stats[lower_key] - safety_margin
-                max_val = stats[upper_key] + safety_margin
+                lo = stats[f'percentile_{int(100 - percentile)}'] - safety_margin
+                hi = stats[f'percentile_{int(percentile)}'] + safety_margin
             else:
-                # 使用绝对最小/最大值
-                min_val = stats['min'] - safety_margin
-                max_val = stats['max'] + safety_margin
-
-            joint_limits[joint_name] = (min_val, max_val)
-
+                lo = stats['min'] - safety_margin
+                hi = stats['max'] + safety_margin
+            joint_limits[jn] = (lo, hi)
         return joint_limits
 
-    def verify_limits(
-        self,
-        joint_limits: Dict[str, Tuple[float, float]],
-        test_poses: Optional[List[Pose]] = None
+    # ── 验证（使用已收集的 IK 解，不重新求解）────────────────────
+
+    def verify_limits_offline(
+        self, joint_limits: Dict[str, Tuple[float, float]]
     ) -> Dict:
-        """
-        验证关节限制是否会导致丢解
+        """用已有的 ik_solutions 验证限位覆盖率（无需重新调 IK）"""
+        total = len(self.ik_solutions)
+        if total == 0:
+            return {'total_tested': 0, 'lost_solutions': 0, 'loss_rate': 0, 'retained_rate': 100}
 
-        Args:
-            joint_limits: 要验证的关节限制
-            test_poses: 测试位姿列表，如果为 None 则使用之前采样的位姿
+        lost = 0
+        for sol in self.ik_solutions:
+            for j, jn in enumerate(self.joint_names):
+                lo, hi = joint_limits[jn]
+                if sol['joints'][j] < lo or sol['joints'][j] > hi:
+                    lost += 1
+                    break
 
-        Returns:
-            验证结果
-        """
-        if test_poses is None:
-            test_poses = self.sampled_poses
-
-        self.get_logger().info(f"\nVerifying joint limits on {len(test_poses)} poses...")
-
-        lost_solutions = 0
-        total_tested = 0
-
-        for i, pose in enumerate(test_poses):
-            if i % 100 == 0:
-                self.get_logger().info(f"Verification progress: {i}/{len(test_poses)}")
-
-            solution = self.solve_ik(pose)
-            if solution is not None:
-                total_tested += 1
-                # 检查解是否在限制范围内
-                within_limits = True
-                for j, joint_name in enumerate(self.joint_names):
-                    min_limit, max_limit = joint_limits[joint_name]
-                    if solution[j] < min_limit or solution[j] > max_limit:
-                        within_limits = False
-                        break
-
-                if not within_limits:
-                    lost_solutions += 1
-
-        loss_rate = (lost_solutions / total_tested * 100) if total_tested > 0 else 0
-
+        loss_rate = lost / total * 100
         result = {
-            'total_tested': total_tested,
-            'lost_solutions': lost_solutions,
+            'total_tested': total,
+            'lost_solutions': lost,
             'loss_rate': loss_rate,
-            'retained_rate': 100 - loss_rate
+            'retained_rate': 100 - loss_rate,
         }
 
-        self.get_logger().info(f"\n=== Verification Results ===")
-        self.get_logger().info(f"Total tested: {total_tested}")
-        self.get_logger().info(f"Lost solutions: {lost_solutions}")
-        self.get_logger().info(f"Loss rate: {loss_rate:.2f}%")
-        self.get_logger().info(f"Retained rate: {result['retained_rate']:.2f}%")
-
+        self.get_logger().info(f"Verification (offline): {total} tested, "
+                               f"{lost} lost ({loss_rate:.2f}%), "
+                               f"{result['retained_rate']:.2f}% retained")
         return result
 
-    def plot_joint_distributions(self, result: Dict, joint_limits: Dict = None):
-        """绘制关节角度分布图"""
-        if len(self.ik_solutions) == 0:
-            self.get_logger().warn("No solutions to plot")
-            return
+    # ── 可视化 ────────────────────────────────────────────────────
 
+    def plot_joint_distributions(self, result: Dict, joint_limits: Dict = None):
+        if len(self.ik_solutions) == 0:
+            return
         all_joints = np.array([sol['joints'] for sol in self.ik_solutions])
 
         fig, axes = plt.subplots(3, 3, figsize=(15, 12))
         axes = axes.flatten()
-
-        for i, joint_name in enumerate(self.joint_names):
+        for i, jn in enumerate(self.joint_names):
             ax = axes[i]
-            joint_angles = all_joints[:, i]
-            stats = result['joint_statistics'][joint_name]
-
-            # 绘制直方图
-            ax.hist(joint_angles, bins=50, alpha=0.7, edgecolor='black')
-
-            # 绘制统计线
-            ax.axvline(stats['min'], color='r', linestyle='--', label=f"Min: {stats['min']:.2f}")
-            ax.axvline(stats['max'], color='r', linestyle='--', label=f"Max: {stats['max']:.2f}")
-            ax.axvline(stats['mean'], color='g', linestyle='-', linewidth=2, label=f"Mean: {stats['mean']:.2f}")
-
-            # 如果提供了限制，绘制限制线
-            if joint_limits and joint_name in joint_limits:
-                min_limit, max_limit = joint_limits[joint_name]
-                ax.axvline(min_limit, color='b', linestyle=':', linewidth=2, label=f"Limit Min: {min_limit:.2f}")
-                ax.axvline(max_limit, color='b', linestyle=':', linewidth=2, label=f"Limit Max: {max_limit:.2f}")
-
+            a = all_joints[:, i]
+            stats = result['joint_statistics'][jn]
+            ax.hist(a, bins=50, alpha=0.7, edgecolor='black')
+            ax.axvline(stats['min'], color='r', ls='--', label=f"Min {stats['min']:.2f}")
+            ax.axvline(stats['max'], color='r', ls='--', label=f"Max {stats['max']:.2f}")
+            ax.axvline(stats['mean'], color='g', lw=2, label=f"Mean {stats['mean']:.2f}")
+            if joint_limits and jn in joint_limits:
+                lo, hi = joint_limits[jn]
+                ax.axvline(lo, color='b', ls=':', lw=2, label=f"Limit {lo:.2f}")
+                ax.axvline(hi, color='b', ls=':', lw=2, label=f"Limit {hi:.2f}")
             ax.set_xlabel('Angle (rad)')
             ax.set_ylabel('Frequency')
-            ax.set_title(f'{joint_name}')
+            ax.set_title(jn)
             ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
-
-        # 删除多余的子图
         for i in range(len(self.joint_names), len(axes)):
             fig.delaxes(axes[i])
-
         plt.tight_layout()
         plt.savefig('joint_distributions.png', dpi=150)
-        self.get_logger().info("Saved joint distribution plot to: joint_distributions.png")
+        self.get_logger().info("Saved: joint_distributions.png")
         plt.close()
 
     def plot_workspace_coverage(self):
-        """绘制工作空间覆盖图"""
-        if len(self.ik_solutions) == 0 and len(self.failed_poses) == 0:
-            self.get_logger().warn("No poses to plot")
+        if not self.ik_solutions and not self.failed_poses:
             return
-
         fig = plt.figure(figsize=(12, 10))
         ax = fig.add_subplot(111, projection='3d')
-
-        # 绘制成功的位姿
-        if len(self.ik_solutions) > 0:
-            success_x = [sol['pose'].position.x for sol in self.ik_solutions]
-            success_y = [sol['pose'].position.y for sol in self.ik_solutions]
-            success_z = [sol['pose'].position.z for sol in self.ik_solutions]
-            ax.scatter(success_x, success_y, success_z, c='g', marker='o', s=10, alpha=0.5, label='IK Success')
-
-        # 绘制失败的位姿
-        if len(self.failed_poses) > 0:
-            failed_x = [pose.position.x for pose in self.failed_poses]
-            failed_y = [pose.position.y for pose in self.failed_poses]
-            failed_z = [pose.position.z for pose in self.failed_poses]
-            ax.scatter(failed_x, failed_y, failed_z, c='r', marker='x', s=20, alpha=0.8, label='IK Failed')
-
+        if self.ik_solutions:
+            xs = [s['pose'].position.x for s in self.ik_solutions]
+            ys = [s['pose'].position.y for s in self.ik_solutions]
+            zs = [s['pose'].position.z for s in self.ik_solutions]
+            ax.scatter(xs, ys, zs, c='g', marker='o', s=10, alpha=0.5, label='IK OK')
+        if self.failed_poses:
+            xs = [p.position.x for p in self.failed_poses]
+            ys = [p.position.y for p in self.failed_poses]
+            zs = [p.position.z for p in self.failed_poses]
+            ax.scatter(xs, ys, zs, c='r', marker='x', s=20, alpha=0.8, label='IK Fail')
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m)')
         ax.set_title('Workspace Coverage')
         ax.legend()
-
         plt.savefig('workspace_coverage.png', dpi=150)
-        self.get_logger().info("Saved workspace coverage plot to: workspace_coverage.png")
+        self.get_logger().info("Saved: workspace_coverage.png")
         plt.close()
 
-    def save_results(self, result: Dict, joint_limits: Dict, verification: Dict, filename: str = 'workspace_analysis.json'):
-        """保存分析结果到 JSON 文件"""
+    # ── 输出 ──────────────────────────────────────────────────────
+
+    def save_results(self, result: Dict, joint_limits: Dict, verification: Dict,
+                     filename: str = 'workspace_analysis.json'):
         output = {
             'analysis': result,
             'recommended_joint_limits': {k: list(v) for k, v in joint_limits.items()},
-            'verification': verification
+            'verification': verification,
         }
-
         with open(filename, 'w') as f:
             json.dump(output, f, indent=2)
-
-        self.get_logger().info(f"Saved results to: {filename}")
+        self.get_logger().info(f"Saved: {filename}")
 
     def print_launch_file_config(self, joint_limits: Dict):
-        """打印可以直接用于 launch 文件的配置"""
-        self.get_logger().info("\n" + "="*60)
+        self.get_logger().info("\n" + "=" * 60)
         self.get_logger().info("LAUNCH FILE CONFIGURATION")
-        self.get_logger().info("="*60)
-        self.get_logger().info("\nCopy this into your launch file:\n")
-
+        self.get_logger().info("=" * 60)
         print("joint_limits_yaml = {")
         print("    'robot_description_planning': {")
         print("        'joint_limits': {")
-
-        for joint_name, (min_limit, max_limit) in joint_limits.items():
-            print(f"            '{joint_name}': {{")
+        for jn, (lo, hi) in joint_limits.items():
+            print(f"            '{jn}': {{")
             print(f"                'has_velocity_limits': True,")
             print(f"                'max_velocity': 1.0,")
             print(f"                'has_acceleration_limits': True,")
             print(f"                'max_acceleration': 2.0,")
             print(f"                'has_position_limits': True,")
-            print(f"                'min_position': {min_limit:.4f},")
-            print(f"                'max_position': {max_limit:.4f}")
+            print(f"                'min_position': {lo:.4f},")
+            print(f"                'max_position': {hi:.4f}")
             print(f"            }},")
-
         print("        }")
         print("    }")
         print("}")
 
 
-def main():
-    """主函数"""
-    rclpy.init()
+# ══════════════════════════════════════════════════════════════════
 
+def main():
+    parser = argparse.ArgumentParser(description="从工作空间推导关节限位")
+    parser.add_argument("--config", default="config/xarm7_config.json", help="机器人配置文件路径")
+    parser.add_argument("--cone-angle", type=float, default=60.0,
+                        help="圆锥全角（度），默认 60 即 home 姿态 ±30°")
+    parser.add_argument("--num-samples", type=int, default=2000, help="采样数量")
+    args = parser.parse_args()
+
+    # 读取配置
+    with open(args.config, 'r') as f:
+        config = json.load(f)
+
+    ws = config["workspace_limits"]
+    x_range = tuple(ws["x"])
+    y_range = tuple(ws["y"])
+    z_range = tuple(ws["z"])
+
+    home_rpy = tuple(config["home"]["orientation"])  # (roll, pitch, yaw)
+    cone_half = args.cone_angle / 2.0
+
+    print("=" * 60)
+    print("Workspace → Joint Limits Analyzer")
+    print("=" * 60)
+    print(f"  Config:       {args.config}")
+    print(f"  Workspace:    x={list(x_range)} y={list(y_range)} z={list(z_range)}")
+    print(f"  Home RPY:     {list(home_rpy)}")
+    print(f"  Cone:         {args.cone_angle:.0f}° (half={cone_half:.0f}°)")
+    print(f"  Samples:      {args.num_samples}")
+    print()
+
+    rclpy.init()
     analyzer = WorkspaceAnalyzer()
 
-    # ========================================
-    # 配置你的工作空间
-    # ========================================
-
-    # 示例 1: 桌面抓取场景
-    workspace_config = {
-        'x_range': (0.2, 0.6),    # 前方 20cm 到 60cm
-        'y_range': (-0.3, 0.3),   # 左右 ±30cm
-        'z_range': (0.1, 0.5),    # 高度 10cm 到 50cm
-        'num_samples': 2000,      # 采样点数量
-        'orientations': [
-            (-np.pi, 0.0, 0.0),           # 向下
-            (-np.pi, 0.0, np.pi/4),       # 向下 + 旋转 45°
-            (-np.pi, 0.0, -np.pi/4),      # 向下 + 旋转 -45°
-            (-np.pi, 0.0, np.pi/2),       # 向下 + 旋转 90°
-            (-np.pi + 0.3, 0.0, 0.0),     # 稍微倾斜
-        ]
-    }
-
-    # 示例 2: 更大的工作空间
-    # workspace_config = {
-    #     'x_range': (0.1, 0.7),
-    #     'y_range': (-0.5, 0.5),
-    #     'z_range': (0.0, 0.6),
-    #     'num_samples': 3000,
-    #     'orientations': None  # 使用默认姿态
-    # }
-
     try:
-        # 步骤 1: 分析工作空间
-        analyzer.get_logger().info("\n" + "="*60)
-        analyzer.get_logger().info("STEP 1: Analyzing Workspace")
-        analyzer.get_logger().info("="*60)
+        # Step 1: 采样
+        analyzer.get_logger().info("\n" + "=" * 60)
+        analyzer.get_logger().info("STEP 1: Sampling workspace (box + cone)")
+        analyzer.get_logger().info("=" * 60)
 
-        result = analyzer.analyze_workspace(**workspace_config)
+        poses = analyzer.sample_workspace_cone(
+            x_range=x_range,
+            y_range=y_range,
+            z_range=z_range,
+            home_rpy=home_rpy,
+            cone_half_angle_deg=cone_half,
+            num_samples=args.num_samples,
+        )
 
+        # Step 2: IK 求解 + 统计
+        analyzer.get_logger().info("\n" + "=" * 60)
+        analyzer.get_logger().info("STEP 2: Solving IK & statistics")
+        analyzer.get_logger().info("=" * 60)
+
+        result = analyzer.analyze(poses)
         if result is None:
             analyzer.get_logger().error("Analysis failed!")
             return
 
-        # 步骤 2: 生成关节限制（多种策略）
-        analyzer.get_logger().info("\n" + "="*60)
-        analyzer.get_logger().info("STEP 2: Generating Joint Limits")
-        analyzer.get_logger().info("="*60)
+        # Step 3: 生成关节限位
+        analyzer.get_logger().info("\n" + "=" * 60)
+        analyzer.get_logger().info("STEP 3: Generating Joint Limits")
+        analyzer.get_logger().info("=" * 60)
 
-        # 策略 A: 保守（99% 百分位 + 0.1 rad 裕度）
         limits_conservative = analyzer.generate_joint_limits(
-            result,
-            safety_margin=0.1,
-            use_percentile=True,
-            percentile=99.0
-        )
-
-        # 策略 B: 平衡（95% 百分位 + 0.15 rad 裕度）
+            result, safety_margin=0.1, use_percentile=True, percentile=99.0)
         limits_balanced = analyzer.generate_joint_limits(
-            result,
-            safety_margin=0.15,
-            use_percentile=True,
-            percentile=95.0
-        )
-
-        # 策略 C: 激进（绝对最小/最大 + 0.05 rad 裕度）
+            result, safety_margin=0.15, use_percentile=True, percentile=95.0)
         limits_aggressive = analyzer.generate_joint_limits(
-            result,
-            safety_margin=0.05,
-            use_percentile=False
-        )
+            result, safety_margin=0.05, use_percentile=False)
 
-        # 打印所有策略
-        analyzer.get_logger().info("\n=== Strategy A: Conservative (99% percentile + 0.1 rad) ===")
-        for joint_name, (min_limit, max_limit) in limits_conservative.items():
-            analyzer.get_logger().info(f"{joint_name}: [{min_limit:.3f}, {max_limit:.3f}]")
+        for label, lim in [("A: Conservative (P99+0.1)", limits_conservative),
+                           ("B: Balanced (P95+0.15)", limits_balanced),
+                           ("C: Aggressive (min/max+0.05)", limits_aggressive)]:
+            analyzer.get_logger().info(f"\n=== {label} ===")
+            for jn, (lo, hi) in lim.items():
+                analyzer.get_logger().info(f"  {jn}: [{lo:.3f}, {hi:.3f}]")
 
-        analyzer.get_logger().info("\n=== Strategy B: Balanced (95% percentile + 0.15 rad) ===")
-        for joint_name, (min_limit, max_limit) in limits_balanced.items():
-            analyzer.get_logger().info(f"{joint_name}: [{min_limit:.3f}, {max_limit:.3f}]")
+        # Step 4: 离线验证（使用已有 IK 解，不重新调服务）
+        analyzer.get_logger().info("\n" + "=" * 60)
+        analyzer.get_logger().info("STEP 4: Offline Verification")
+        analyzer.get_logger().info("=" * 60)
 
-        analyzer.get_logger().info("\n=== Strategy C: Aggressive (absolute min/max + 0.05 rad) ===")
-        for joint_name, (min_limit, max_limit) in limits_aggressive.items():
-            analyzer.get_logger().info(f"{joint_name}: [{min_limit:.3f}, {max_limit:.3f}]")
+        v_con = analyzer.verify_limits_offline(limits_conservative)
+        v_bal = analyzer.verify_limits_offline(limits_balanced)
+        v_agg = analyzer.verify_limits_offline(limits_aggressive)
 
-        # 步骤 3: 验证限制（使用平衡策略）
-        analyzer.get_logger().info("\n" + "="*60)
-        analyzer.get_logger().info("STEP 3: Verifying Joint Limits")
-        analyzer.get_logger().info("="*60)
+        analyzer.get_logger().info(f"\n=== Summary ===")
+        analyzer.get_logger().info(f"  Conservative: {v_con['retained_rate']:.2f}% retained")
+        analyzer.get_logger().info(f"  Balanced:     {v_bal['retained_rate']:.2f}% retained")
+        analyzer.get_logger().info(f"  Aggressive:   {v_agg['retained_rate']:.2f}% retained")
 
-        verification_conservative = analyzer.verify_limits(limits_conservative)
-        verification_balanced = analyzer.verify_limits(limits_balanced)
-        verification_aggressive = analyzer.verify_limits(limits_aggressive)
-
-        analyzer.get_logger().info("\n=== Verification Summary ===")
-        analyzer.get_logger().info(f"Conservative: {verification_conservative['retained_rate']:.2f}% retained")
-        analyzer.get_logger().info(f"Balanced: {verification_balanced['retained_rate']:.2f}% retained")
-        analyzer.get_logger().info(f"Aggressive: {verification_aggressive['retained_rate']:.2f}% retained")
-
-        # 步骤 4: 生成可视化
-        analyzer.get_logger().info("\n" + "="*60)
-        analyzer.get_logger().info("STEP 4: Generating Visualizations")
-        analyzer.get_logger().info("="*60)
+        # Step 5: 可视化
+        analyzer.get_logger().info("\n" + "=" * 60)
+        analyzer.get_logger().info("STEP 5: Visualizations")
+        analyzer.get_logger().info("=" * 60)
 
         analyzer.plot_joint_distributions(result, limits_balanced)
         analyzer.plot_workspace_coverage()
 
-        # 步骤 5: 保存结果
-        analyzer.get_logger().info("\n" + "="*60)
-        analyzer.get_logger().info("STEP 5: Saving Results")
-        analyzer.get_logger().info("="*60)
-
-        analyzer.save_results(result, limits_balanced, verification_balanced)
-
-        # 步骤 6: 打印 launch 文件配置
+        # Step 6: 保存 & 输出
+        analyzer.save_results(result, limits_balanced, v_bal)
         analyzer.print_launch_file_config(limits_balanced)
 
         # 推荐
-        analyzer.get_logger().info("\n" + "="*60)
+        analyzer.get_logger().info("\n" + "=" * 60)
         analyzer.get_logger().info("RECOMMENDATION")
-        analyzer.get_logger().info("="*60)
-
-        if verification_balanced['retained_rate'] >= 95:
-            analyzer.get_logger().info("✓ Balanced strategy is recommended (>95% solutions retained)")
-        elif verification_conservative['retained_rate'] >= 95:
-            analyzer.get_logger().info("✓ Conservative strategy is recommended (>95% solutions retained)")
+        analyzer.get_logger().info("=" * 60)
+        if v_bal['retained_rate'] >= 95:
+            analyzer.get_logger().info("✓ Balanced strategy recommended (≥95% retained)")
+        elif v_con['retained_rate'] >= 95:
+            analyzer.get_logger().info("✓ Conservative strategy recommended (≥95% retained)")
         else:
-            analyzer.get_logger().warn("⚠ All strategies lose >5% of solutions. Consider:")
-            analyzer.get_logger().warn("  1. Expanding the joint limits")
-            analyzer.get_logger().warn("  2. Reducing the workspace size")
-            analyzer.get_logger().warn("  3. Using workspace constraints instead of joint limits")
+            analyzer.get_logger().info("⚠ All strategies lose >5%. Consider expanding limits or reducing workspace.")
 
     except Exception as e:
         analyzer.get_logger().error(f"Error: {e}")
