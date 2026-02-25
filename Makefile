@@ -18,7 +18,7 @@ docker:
 		-v /comp_robot/shock/hf_cache:/comp_robot/shock/hf_cache \
 		-v /data1/comp_robot:/comp_robot \
 		-v /data1/vePFS:/vePFS \
-		-w /workspace \
+		-w /workspace/moveit-service \
 		-p 14086:14086 \
 		-e ROS_DOMAIN_ID=10 \
 		visincept-cn-shanghai.cr.volces.com/grasp/sif:v7.0 \
@@ -50,7 +50,12 @@ octo-server:
 		-r cloud_in:=/camera/depth/color/points
 
 service:
+	source set-env.sh
+	/usr/bin/python3 moveit_service.py
 
+client:
+	source set-env.sh
+	/usr/bin/python3 grasp_client.py
 
 # 	xvfb-run ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false 2 > log/moveit.log & tail -f log/moveit.log
 
