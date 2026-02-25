@@ -2,17 +2,37 @@ SHELL := /bin/bash
 .SHELLFLAGS := -e -o pipefail -c
 .ONESHELL:
 
+DOCKER_CONTAINER := moveit
 #sudo apt install -y ros-jazzy-octomap-server ros-jazzy-octomap-ros ros-jazzy-octomap-rviz-plugins
 set-env:
 	source set-env.sh
 
 
-debug:
-	source set-env.sh
-	/usr/bin/python3 tests/create_scene_with_pc.py
+docker:
+	docker run -it --rm \
+		--name ${DOCKER_CONTAINER} \
+		--shm-size=8g \
+		-v /data1/shock/workspace/service/..:/workspace \
+		-v /data1:/data1 \
+		-v /comp_robot/shock/hf_cache:/root/.cache \
+		-v /comp_robot/shock/hf_cache:/comp_robot/shock/hf_cache \
+		-v /data1/comp_robot:/comp_robot \
+		-v /data1/vePFS:/vePFS \
+		-w /workspace \
+		-p 14086:14086 \
+		-e ROS_DOMAIN_ID=10 \
+		visincept-cn-shanghai.cr.volces.com/grasp/sif:v7.0 \
+		bash -c "/bin/bash"
 
 exec:
-	docker exec -it  -e DISPLAY=:1 -w /workspace/moveit-service sif bash
+	docker exec -it  -e DISPLAY=:1 -w /workspace/moveit-service ${DOCKER_CONTAINER} bash
+
+
+debug:
+	source set-env.sh
+	/usr/bin/python3 pointcloud_to_moveit_convexhull.py
+	#/usr/bin/python3 tests/create_scene_with_pc.py
+
 
 build:
 	source set-env.sh
@@ -28,6 +48,8 @@ octo-server:
 		-p frame_id:=world \
 		-p resolution:=0.005 \
 		-r cloud_in:=/camera/depth/color/points
+
+service:
 
 
 # 	xvfb-run ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false 2 > log/moveit.log & tail -f log/moveit.log
