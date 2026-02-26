@@ -19,7 +19,6 @@ docker:
 		-v /data1/comp_robot:/comp_robot \
 		-v /data1/vePFS:/vePFS \
 		-w /workspace/moveit-service \
-		-p 14086:14086 \
 		-e ROS_DOMAIN_ID=10 \
 		visincept-cn-shanghai.cr.volces.com/grasp/sif:v7.0 \
 		bash -c "/bin/bash"
@@ -55,7 +54,7 @@ service:
 
 client:
 	source set-env.sh
-	/usr/bin/python3 grasp_client.py
+	/usr/bin/python3 grasp_client.py --target 3
 
 # 	xvfb-run ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false 2 > log/moveit.log & tail -f log/moveit.log
 
