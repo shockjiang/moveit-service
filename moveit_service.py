@@ -1,256 +1,42 @@
 #!/usr/bin/env python3
 import json
+import os
+import queue
+import socket
+import sys
+import tempfile
 import time
 import threading
-from flask import Flask, request, jsonify
+import traceback
+import uuid
 
+from flask import Flask, request, jsonify
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
+from trajectory_msgs.msg import JointTrajectoryPoint
+from moveit_msgs.msg import RobotTrajectory, MoveItErrorCodes
+from builtin_interfaces.msg import Duration
 
-from moveit_grasp_core import XArmGraspExecutor, _execute_grasp_core, _trajectory_to_json_safe, _trajectory_to_full_json
+from moveit_grasp_core import GraspExecutor, _execute_grasp_core
 
-
-# 全局变量
-executor_node = None
-ros_executor = None
-ros_thread = None
-ros_worker_thread = None
-task_queue = None  # 任务队列
-result_queue = None  # 结果队列
 app = Flask(__name__)
 
-def ros_worker():
-    """ROS2工作线程 - 处理任务队列中的规划请求"""
-    global task_queue, result_queue, executor_node
-
-    print("✓ ROS2工作线程已启动")
-
-    while True:
-        try:
-            # 从队列获取任务
-            task = task_queue.get()
-
-            if task is None:  # 退出信号
-                break
-
-            task_id = task["task_id"]
-            task_type = task["type"]
-            params = task["params"]
-
-            print(f"[Worker] 处理任务 {task_id}: {task_type}")
-
-            try:
-                if task_type == "grasp":
-                    # 执行抓取规划
-                    print(f"[Worker] 开始执行抓取任务 {task_id}")
-                    result = run_grasp_pipeline(
-                        depth_path=params["depth_path"],
-                        seg_json_path=params["seg_json_path"],
-                        affordance_path=params["affordance_path"],
-                        target_object_index=params.get("target_object_index"),
-                        return_trajectories=params.get("return_trajectories", False)
-                    )
-                    print(f"[Worker] 抓取任务完成，结果: {result.get('success')}")
-                elif task_type == "update_scene":
-                    # 更新场景
-                    executor_node.scene_manager.update_scene(
-                        params["depth_path"],
-                        params["seg_json_path"]
-                    )
-                    result = {"success": True, "message": "场景更新成功"}
-
-                elif task_type == "move_home":
-                    result = _run_move_home(executor_node)
-
-                elif task_type == "execute_trajectory":
-                    result = _run_execute_trajectory(executor_node, params["trajectory_json"])
-
-                elif task_type == "set_gripper":
-                    result = _run_set_gripper(executor_node, params["position"])
-
-                else:
-                    result = {"success": False, "message": f"未知任务类型: {task_type}"}
-
-                # 将结果放入结果队列
-                print(f"[Worker] 将结果放入队列: task_id={task_id}, success={result.get('success')}")
-                result_queue.put({"task_id": task_id, "result": result})
-                print(f"[Worker] 任务 {task_id} 完成，结果已放入队列")
-
-            except Exception as e:
-                print(f"[Worker] 任务 {task_id} 执行出错: {e}")
-                import traceback
-                traceback.print_exc()
-                result_queue.put({
-                    "task_id": task_id,
-                    "result": {"success": False, "message": f"执行出错: {str(e)}"}
-                })
-
-            finally:
-                task_queue.task_done()
-
-        except Exception as e:
-            print(f"[Worker] 工作线程错误: {e}")
-            import traceback
-            traceback.print_exc()
-
-def init_ros_service(robot_name="xarm7", execution_mode=True):
-    """初始化ROS服务（后台运行）"""
-    global executor_node, ros_executor, ros_thread, ros_worker_thread, task_queue, result_queue
-
-    if executor_node is not None:
-        return
-
-    # 加载配置
-    config_path = f"config/{robot_name}_config.json"
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-
-    rclpy.init()
-    executor_node = XArmGraspExecutor(
-        execution_mode=execution_mode,
-        camera_params=config["camera"],
-        config=config
-    )
-
-    # 启动ROS后台线程 - 使用MultiThreadedExecutor支持多线程调用
-    ros_executor = MultiThreadedExecutor(num_threads=4)
-    ros_executor.add_node(executor_node)
-
-    def ros_spin():
-        try:
-            ros_executor.spin()
-        except Exception as e:
-            print(f"ROS spin error: {e}")
-
-    ros_thread = threading.Thread(target=ros_spin, daemon=True)
-    ros_thread.start()
-
-    # 初始化任务队列
-    import queue
-    task_queue = queue.Queue()
-    result_queue = queue.Queue()
-
-    # 启动ROS2工作线程
-    ros_worker_thread = threading.Thread(target=ros_worker, daemon=True)
-    ros_worker_thread.start()
-
-    # 等待节点完全初始化
-    time.sleep(2.0)
-
-    print(f"✓ ROS服务已启动 (robot={robot_name}, execution_mode={execution_mode})")
+# Global state
+_node: GraspExecutor = None
+_task_queue: queue.Queue = None
+_result_queue: queue.Queue = None
+_ros_exec: MultiThreadedExecutor = None
+_worker_thread: threading.Thread = None
+_current_robot: str = None
+_execution_mode: bool = False
+_init_lock = threading.Lock()
 
 
-@app.route('/', methods=['GET'])
-def index():
-    """服务欢迎页面"""
-    return jsonify({
-        "service": "MoveIt HTTP Service",
-        "version": "1.0",
-        "robot": executor_node.planning_group if executor_node else "unknown",
-        "endpoints": {
-            "health": "GET /health - 健康检查",
-            "update_scene": "POST /update_scene - 更新场景",
-            "grasp": "POST /grasp - 执行抓取规划",
-            "move_home": "POST /move_home - 移动到HOME位置",
-            "execute_trajectory": "POST /execute_trajectory - 执行轨迹",
-            "set_gripper": "POST /set_gripper - 控制夹爪",
-            "cleanup": "POST /cleanup - 清理场景（客户端执行完后调用）"
-        },
-        "status": "运行中"
-    })
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """健康检查"""
-    try:
-        if executor_node is None:
-            return jsonify({"status": "error", "message": "服务未初始化"}), 503
-        return jsonify({"status": "healthy", "robot": executor_node.planning_group})
-    except Exception as e:
-        print(f"Health check error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route('/remove_object', methods=['POST'])
-def remove_object():
-    """从场景中移除指定碰撞物体"""
-    global executor_node
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
-    try:
-        data = request.get_json()
-        instance_id = data.get("instance_id")
-        if not instance_id:
-            return jsonify({"success": False, "message": "缺少 instance_id"}), 400
-        ok = executor_node.remove_object_from_scene(instance_id)
-        return jsonify({"success": ok})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-
-
-@app.route('/attach_object', methods=['POST'])
-def attach_object():
-    """将物体附着到夹爪"""
-    global executor_node
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
-    try:
-        data = request.get_json()
-        instance_id = data.get("instance_id")
-        if not instance_id:
-            return jsonify({"success": False, "message": "缺少 instance_id"}), 400
-        ok = executor_node.attach_object_mesh(instance_id)
-        return jsonify({"success": ok})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-
-
-@app.route('/detach_object', methods=['POST'])
-def detach_object():
-    """从夹爪分离物体"""
-    global executor_node
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
-    try:
-        ok = executor_node.detach_object()
-        return jsonify({"success": ok})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-
-
-@app.route('/cleanup', methods=['POST'])
-def cleanup_scene():
-    """清理场景（客户端执行完毕后调用）"""
-    global executor_node
-
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
-
-    try:
-        data = request.get_json() or {}
-        basket_id = data.get("basket_id", "basket_1")
-
-        executor_node.detach_object()
-        import time as _time
-        _time.sleep(0.3)
-        executor_node.clear_pointcloud_obstacles()
-        executor_node.remove_basket_from_scene(basket_id)
-        executor_node.clear_octomap()
-        _time.sleep(0.5)
-
-        return jsonify({"success": True, "message": "场景清理完成"})
-    except Exception as e:
-        return jsonify({"success": False, "message": f"清理失败: {str(e)}"}), 500
-
+# ---------------------------------------------------------------------------
+#  Worker-thread task handlers (safe to call ROS actions)
+# ---------------------------------------------------------------------------
 
 def _json_to_robot_trajectory(traj_json):
-    """将JSON轨迹数据反序列化为RobotTrajectory消息（服务端使用）"""
-    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-    from moveit_msgs.msg import RobotTrajectory
-    from builtin_interfaces.msg import Duration
-
     traj = RobotTrajectory()
     jt = traj.joint_trajectory
     jt.joint_names = traj_json["joint_names"]
@@ -269,372 +55,496 @@ def _json_to_robot_trajectory(traj_json):
     return traj
 
 
-def _run_move_home(node):
-    """在ROS工作线程中执行移动到HOME位置"""
-    from moveit_msgs.msg import MoveItErrorCodes
+def _run_update_scene(node, params):
+    node.scene_manager.update_scene(params["depth_path"], params["seg_json_path"])
+    return {"success": True, "message": "Scene updated"}
+
+
+def _run_move_home(node, _params):
+    config = node.config
+    n_joints = len(node.arm_joint_names)
+    home_joints = config.get("home", {}).get("joints", [0.0] * n_joints)
+
+    original_mode = node.execution_mode
+    node.execution_mode = True
     try:
-        config = node.config
-        home_joints = config.get("home", {}).get("joints", [0.0] * 7)
+        goal = node.build_joint_goal(
+            joint_positions=home_joints,
+            drive_joint_rad=node.gripper_joint_max,
+            tolerance=0.001,
+            allowed_time=30.0,
+            planner_id="RRTConnect",
+            start_joint_state=None,
+            plan_only=False,
+        )
+        result_msg = node._send_action_goal(
+            node.move_action_client, goal,
+            send_timeout=30.0, result_timeout=60.0, label="[HOME]")
 
-        # 确保execution_mode为True以实际执行
-        original_mode = node.execution_mode
-        node.execution_mode = True
-
-        try:
-            # 规划到HOME
-            goal = node.build_joint_goal(
-                joint_positions=home_joints,
-                drive_joint_rad=node.gripper_joint_max,
-                tolerance=0.001,
-                allowed_time=30.0,
-                planner_id="RRTConnect",
-                start_joint_state=None,
-                plan_only=False  # plan + execute
-            )
-
-            future = node.move_action_client.send_goal_async(goal)
-            start_time = time.time()
-            while not future.done():
-                node._spin_wait(0.1)
-                if time.time() - start_time > 30.0:
-                    return {"success": False, "message": "HOME goal send timeout"}
-
-            goal_handle = future.result()
-            if not goal_handle or not goal_handle.accepted:
-                return {"success": False, "message": "HOME goal rejected"}
-
-            result_future = goal_handle.get_result_async()
-            start_time = time.time()
-            while not result_future.done():
-                node._spin_wait(0.1)
-                if time.time() - start_time > 60.0:
-                    return {"success": False, "message": "HOME execution timeout"}
-
-            result_msg = result_future.result()
-            if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
-                error_val = result_msg.result.error_code.val if result_msg else "None"
-                return {"success": False, "message": f"HOME failed, error_code={error_val}"}
-
-            return {"success": True, "message": "HOME position reached"}
-
-        finally:
-            node.execution_mode = original_mode
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"success": False, "message": f"move_home error: {str(e)}"}
+        if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
+            error_val = result_msg.result.error_code.val if result_msg else "None"
+            return {"success": False, "message": f"HOME failed, error_code={error_val}"}
+        return {"success": True, "message": "HOME position reached"}
+    finally:
+        node.execution_mode = original_mode
 
 
-def _run_execute_trajectory(node, traj_json):
-    """在ROS工作线程中执行轨迹"""
+def _run_execute_trajectory(node, params):
+    traj = _json_to_robot_trajectory(params["trajectory_json"])
+
+    original_mode = node.execution_mode
+    node.execution_mode = True
     try:
-        traj = _json_to_robot_trajectory(traj_json)
+        ok = node.execute_trajectory(traj, timeout_sec=120.0)
+    finally:
+        node.execution_mode = original_mode
 
-        # 确保execution_mode为True
-        original_mode = node.execution_mode
-        node.execution_mode = True
-
-        try:
-            ok = node.execute_trajectory(traj, timeout_sec=120.0)
-        finally:
-            node.execution_mode = original_mode
-
-        if ok:
-            return {"success": True, "message": "Trajectory executed"}
-        else:
-            return {"success": False, "message": "Trajectory execution failed"}
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"success": False, "message": f"execute_trajectory error: {str(e)}"}
+    if ok:
+        return {"success": True, "message": "Trajectory executed"}
+    return {"success": False, "message": "Trajectory execution failed"}
 
 
-def _run_set_gripper(node, position):
-    """在ROS工作线程中控制夹爪"""
+def _run_set_gripper(node, params):
+    original_mode = node.execution_mode
+    node.execution_mode = True
     try:
-        # 确保execution_mode为True
-        original_mode = node.execution_mode
-        node.execution_mode = True
+        ok = node.set_gripper(float(params["position"]))
+    finally:
+        node.execution_mode = original_mode
 
+    if ok:
+        return {"success": True, "message": f"Gripper set to {params['position']}"}
+    return {"success": False, "message": "Gripper control failed"}
+
+
+def _run_grasp(node, params):
+    plan_only = params.get("plan_only", False)
+
+    original_mode = node.execution_mode
+    if plan_only:
+        node.execution_mode = False
+    try:
+        results = _execute_grasp_core(
+            executor=node,
+            depth_path=params["depth_path"],
+            seg_json_path=params["seg_json_path"],
+            affordance_path=params["affordance_path"],
+            config=node.config,
+            target_object_index=params.get("target_object_index"),
+            return_full_trajectories=params.get("return_trajectories", True),
+        )
+        if results and results[0]["success"]:
+            return {"success": True, "message": "Grasp completed", "results": results}
+        return {"success": False, "message": "Grasp planning failed"}
+    finally:
+        node.execution_mode = original_mode
+
+
+_TASK_DISPATCH = {
+    "update_scene": _run_update_scene,
+    "move_home": _run_move_home,
+    "execute_trajectory": _run_execute_trajectory,
+    "set_gripper": _run_set_gripper,
+    "grasp": _run_grasp,
+}
+
+
+# ---------------------------------------------------------------------------
+#  Worker thread + submit helper
+# ---------------------------------------------------------------------------
+
+def _ros_worker():
+    print("[Worker] ROS2 worker thread started")
+    while True:
         try:
-            ok = node.set_gripper(float(position))
-        finally:
-            node.execution_mode = original_mode
+            task = _task_queue.get()
+            if task is None:
+                break
 
-        if ok:
-            return {"success": True, "message": f"Gripper set to {position}"}
-        else:
-            return {"success": False, "message": "Gripper control failed"}
+            task_id = task["task_id"]
+            task_type = task["type"]
+            params = task["params"]
+            print(f"[Worker] Processing {task_id}: {task_type}")
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"success": False, "message": f"set_gripper error: {str(e)}"}
+            try:
+                handler = _TASK_DISPATCH.get(task_type)
+                if handler is None:
+                    result = {"success": False, "message": f"Unknown task type: {task_type}"}
+                else:
+                    result = handler(_node, params)
+                _result_queue.put({"task_id": task_id, "result": result})
+            except Exception:
+                traceback.print_exc()
+                _result_queue.put({
+                    "task_id": task_id,
+                    "result": {"success": False, "message": traceback.format_exc()},
+                })
+            finally:
+                _task_queue.task_done()
+        except Exception:
+            traceback.print_exc()
 
 
 def _submit_and_wait(task_type, params, timeout=120):
-    """提交任务到ROS工作线程并等待结果"""
-    global task_queue, result_queue
-    import uuid
     task_id = str(uuid.uuid4())
+    _task_queue.put({"task_id": task_id, "type": task_type, "params": params})
 
-    task_queue.put({
-        "task_id": task_id,
-        "type": task_type,
-        "params": params
-    })
-
-    start_time = time.time()
+    deadline = time.monotonic() + timeout
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"success": False, "message": "Task timeout"}
         try:
-            result_item = result_queue.get(timeout=1)
-            if result_item["task_id"] == task_id:
-                return result_item["result"]
-            else:
-                result_queue.put(result_item)
-        except:
+            item = _result_queue.get(timeout=min(remaining, 1.0))
+            if item["task_id"] == task_id:
+                return item["result"]
+            _result_queue.put(item)
+        except queue.Empty:
             pass
 
-        if time.time() - start_time > timeout:
-            return {"success": False, "message": "任务超时"}
 
+# ---------------------------------------------------------------------------
+#  Initialization / shutdown
+# ---------------------------------------------------------------------------
 
-@app.route('/move_home', methods=['POST'])
-def move_home():
-    """规划并执行移动到HOME位置"""
-    global executor_node
+def _shutdown_ros():
+    global _node, _task_queue, _result_queue, _ros_exec, _worker_thread, _current_robot
 
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
+    if _task_queue is not None:
+        _task_queue.put(None)
+    if _worker_thread is not None:
+        _worker_thread.join(timeout=5.0)
+        _worker_thread = None
 
-    try:
-        result = _submit_and_wait("move_home", {}, timeout=120)
-        status_code = 200 if result.get("success") else 500
-        return jsonify(result), status_code
-    except Exception as e:
-        return jsonify({"success": False, "message": f"move_home failed: {str(e)}"}), 500
+    if _ros_exec is not None:
+        _ros_exec.shutdown()
+        _ros_exec = None
 
-
-@app.route('/execute_trajectory', methods=['POST'])
-def execute_trajectory():
-    """执行JSON格式的轨迹"""
-    global executor_node
-
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
+    if _node is not None:
+        _node.destroy_node()
+        _node = None
 
     try:
-        data = request.get_json()
-        traj_json = data.get("trajectory")
+        if rclpy.ok():
+            rclpy.shutdown()
+    except Exception:
+        pass
 
-        if not traj_json:
-            return jsonify({"success": False, "message": "缺少 trajectory 参数"}), 400
-
-        if "joint_names" not in traj_json or "points" not in traj_json:
-            return jsonify({"success": False, "message": "trajectory 格式错误，需要 joint_names 和 points"}), 400
-
-        result = _submit_and_wait("execute_trajectory", {"trajectory_json": traj_json}, timeout=180)
-        status_code = 200 if result.get("success") else 500
-        return jsonify(result), status_code
-    except Exception as e:
-        return jsonify({"success": False, "message": f"execute_trajectory failed: {str(e)}"}), 500
+    _task_queue = None
+    _result_queue = None
+    _current_robot = None
+    time.sleep(1.0)
 
 
-@app.route('/set_gripper', methods=['POST'])
-def set_gripper():
-    """控制夹爪位置"""
-    global executor_node
+def init_ros_service(robot_name, execution_mode=True):
+    global _node, _task_queue, _result_queue, _ros_exec, _worker_thread
+    global _current_robot, _execution_mode
 
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
+    with _init_lock:
+        if _node is not None and _current_robot == robot_name:
+            return
 
-    try:
-        data = request.get_json()
-        position = data.get("position")
+        if _node is not None:
+            print(f"[Init] Switching robot: {_current_robot} -> {robot_name}")
+            _shutdown_ros()
 
-        if position is None:
-            return jsonify({"success": False, "message": "缺少 position 参数"}), 400
+        config_path = f"config/{robot_name}_config.json"
+        with open(config_path, "r") as f:
+            config = json.load(f)
 
-        result = _submit_and_wait("set_gripper", {"position": float(position)}, timeout=30)
-        status_code = 200 if result.get("success") else 500
-        return jsonify(result), status_code
-    except Exception as e:
-        return jsonify({"success": False, "message": f"set_gripper failed: {str(e)}"}), 500
+        if not rclpy.ok():
+            rclpy.init()
+
+        _node = GraspExecutor(
+            execution_mode=execution_mode,
+            camera_params=config["camera"],
+            config=config,
+        )
+        _execution_mode = execution_mode
+
+        _ros_exec = MultiThreadedExecutor(num_threads=4)
+        _ros_exec.add_node(_node)
+        threading.Thread(target=_ros_exec.spin, daemon=True).start()
+
+        _task_queue = queue.Queue()
+        _result_queue = queue.Queue()
+        _worker_thread = threading.Thread(target=_ros_worker, daemon=True)
+        _worker_thread.start()
+
+        _current_robot = robot_name
+        time.sleep(2.0)
+        print(f"[Init] ROS service ready (robot={robot_name}, execution_mode={execution_mode})")
 
 
-@app.route('/update_scene', methods=['POST'])
+def _ensure_robot(data):
+    """If request includes 'robot', ensure the service is initialized for that robot."""
+    robot = data.get("robot") if isinstance(data, dict) else None
+    if robot and robot != _current_robot:
+        init_ros_service(robot_name=robot, execution_mode=_execution_mode)
+
+
+# ---------------------------------------------------------------------------
+#  Flask routes
+# ---------------------------------------------------------------------------
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    traceback.print_exc()
+    return jsonify({"success": False, "message": str(e)}), 500
+
+
+def _check_node():
+    if _node is None:
+        return jsonify({"success": False, "message": "Service not initialized"}), 503
+    return None
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "MoveIt HTTP Service",
+        "version": "1.0",
+        "robot": _current_robot or "unknown",
+        "endpoints": {
+            "health": "GET /health",
+            "update_scene": "POST /update_scene",
+            "grasp": "POST /grasp",
+            "forward": "POST /forward (multipart: depth file + JSON fields)",
+            "move_home": "POST /move_home",
+            "execute_trajectory": "POST /execute_trajectory",
+            "set_gripper": "POST /set_gripper",
+            "cleanup": "POST /cleanup",
+            "remove_object": "POST /remove_object",
+            "attach_object": "POST /attach_object",
+            "detach_object": "POST /detach_object",
+        },
+    })
+
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    err = _check_node()
+    if err:
+        return err
+    return jsonify({"status": "healthy", "robot": _current_robot})
+
+
+@app.route("/remove_object", methods=["POST"])
+def remove_object():
+    err = _check_node()
+    if err:
+        return err
+    data = request.get_json()
+    instance_id = data.get("instance_id")
+    if not instance_id:
+        return jsonify({"success": False, "message": "Missing instance_id"}), 400
+    ok = _node.remove_object_from_scene(instance_id)
+    return jsonify({"success": ok})
+
+
+@app.route("/attach_object", methods=["POST"])
+def attach_object():
+    err = _check_node()
+    if err:
+        return err
+    data = request.get_json()
+    instance_id = data.get("instance_id")
+    if not instance_id:
+        return jsonify({"success": False, "message": "Missing instance_id"}), 400
+    ok = _node.attach_object_mesh(instance_id)
+    return jsonify({"success": ok})
+
+
+@app.route("/detach_object", methods=["POST"])
+def detach_object():
+    err = _check_node()
+    if err:
+        return err
+    ok = _node.detach_object()
+    return jsonify({"success": ok})
+
+
+@app.route("/cleanup", methods=["POST"])
+def cleanup_scene():
+    err = _check_node()
+    if err:
+        return err
+    data = request.get_json() or {}
+    basket_id = data.get("basket_id", "basket_1")
+
+    _node.detach_object()
+    time.sleep(0.3)
+    _node.clear_pointcloud_obstacles()
+    _node.remove_basket_from_scene(basket_id)
+    _node.clear_octomap()
+    time.sleep(0.5)
+    return jsonify({"success": True, "message": "Scene cleanup done"})
+
+
+@app.route("/update_scene", methods=["POST"])
 def update_scene():
-    """更新场景（添加碰撞物体）"""
-    global executor_node, task_queue, result_queue
+    data = request.get_json()
+    _ensure_robot(data)
+    err = _check_node()
+    if err:
+        return err
+    if not data.get("depth_path") or not data.get("seg_json_path"):
+        return jsonify({"success": False, "message": "Missing depth_path or seg_json_path"}), 400
 
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
+    result = _submit_and_wait("update_scene", {
+        "depth_path": data["depth_path"],
+        "seg_json_path": data["seg_json_path"],
+    }, timeout=30)
+    return jsonify(result), 200 if result.get("success") else 500
 
+
+@app.route("/move_home", methods=["POST"])
+def move_home():
+    data = request.get_json() or {}
+    _ensure_robot(data)
+    err = _check_node()
+    if err:
+        return err
+    result = _submit_and_wait("move_home", {}, timeout=120)
+    return jsonify(result), 200 if result.get("success") else 500
+
+
+@app.route("/execute_trajectory", methods=["POST"])
+def execute_trajectory():
+    err = _check_node()
+    if err:
+        return err
+    data = request.get_json()
+    traj_json = data.get("trajectory")
+    if not traj_json or "joint_names" not in traj_json or "points" not in traj_json:
+        return jsonify({"success": False, "message": "Missing or invalid trajectory"}), 400
+
+    result = _submit_and_wait("execute_trajectory", {"trajectory_json": traj_json}, timeout=180)
+    return jsonify(result), 200 if result.get("success") else 500
+
+
+@app.route("/set_gripper", methods=["POST"])
+def set_gripper():
+    err = _check_node()
+    if err:
+        return err
+    data = request.get_json()
+    position = data.get("position")
+    if position is None:
+        return jsonify({"success": False, "message": "Missing position"}), 400
+
+    result = _submit_and_wait("set_gripper", {"position": float(position)}, timeout=30)
+    return jsonify(result), 200 if result.get("success") else 500
+
+
+@app.route("/grasp", methods=["POST"])
+def execute_grasp():
+    data = request.get_json()
+    _ensure_robot(data)
+    err = _check_node()
+    if err:
+        return err
+
+    depth_path = data.get("depth_path")
+    seg_json_path = data.get("seg_json_path")
+    affordance_path = data.get("affordance_path")
+    if not all([depth_path, seg_json_path, affordance_path]):
+        return jsonify({"success": False, "message": "Missing depth_path, seg_json_path, or affordance_path"}), 400
+
+    result = _submit_and_wait("grasp", {
+        "depth_path": depth_path,
+        "seg_json_path": seg_json_path,
+        "affordance_path": affordance_path,
+        "target_object_index": data.get("target_object_index"),
+        "plan_only": data.get("plan_only", False),
+        "return_trajectories": data.get("return_trajectories", True),
+    }, timeout=1800)
+    return jsonify(result), 200 if result.get("success") else 500
+
+
+@app.route("/forward", methods=["POST"])
+def forward():
+    """Accept uploaded depth image + JSON strings, run grasp planning."""
+    # --- parse multipart form data ---
+    if "depth" not in request.files:
+        return jsonify({"success": False, "message": "Missing 'depth' file upload"}), 400
+
+    seg_json_str = request.form.get("seg_json")
+    affordance_json_str = request.form.get("affordance_json")
+    if not seg_json_str or not affordance_json_str:
+        return jsonify({"success": False, "message": "Missing seg_json or affordance_json"}), 400
+
+    robot_name = request.form.get("robot_name", "xarm7")
+    target_object_index_str = request.form.get("target_object_index", "-1")
     try:
-        data = request.get_json()
-        depth_path = data.get("depth_path")
-        seg_json_path = data.get("seg_json_path")
+        target_object_index = int(target_object_index_str)
+    except (ValueError, TypeError):
+        target_object_index = -1
+    if target_object_index < 0:
+        target_object_index = None
 
-        if not all([depth_path, seg_json_path]):
-            return jsonify({"success": False, "message": "缺少必要参数: depth_path, seg_json_path"}), 400
+    # --- ensure robot is initialized ---
+    _ensure_robot({"robot": robot_name})
+    err = _check_node()
+    if err:
+        return err
 
-        # 生成任务ID
-        import uuid
-        task_id = str(uuid.uuid4())
+    # --- write uploads to temporary files ---
+    tmp_files = []
+    try:
+        depth_file = request.files["depth"]
+        tmp_depth = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        depth_file.save(tmp_depth)
+        tmp_depth.close()
+        tmp_files.append(tmp_depth.name)
 
-        # 提交任务到队列
-        task = {
-            "task_id": task_id,
-            "type": "update_scene",
-            "params": {
-                "depth_path": depth_path,
-                "seg_json_path": seg_json_path
-            }
-        }
-        task_queue.put(task)
+        tmp_seg = tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False)
+        tmp_seg.write(seg_json_str)
+        tmp_seg.close()
+        tmp_files.append(tmp_seg.name)
 
-        # 等待结果
-        timeout = 30  # 30秒
-        start_time = time.time()
-        while True:
+        tmp_aff = tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False)
+        tmp_aff.write(affordance_json_str)
+        tmp_aff.close()
+        tmp_files.append(tmp_aff.name)
+
+        # --- run grasp planning ---
+        result = _submit_and_wait("grasp", {
+            "depth_path": tmp_depth.name,
+            "seg_json_path": tmp_seg.name,
+            "affordance_path": tmp_aff.name,
+            "target_object_index": target_object_index,
+            "plan_only": True,
+            "return_trajectories": True,
+        }, timeout=1800)
+
+        # --- cleanup scene ---
+        try:
+            _node.detach_object()
+            time.sleep(0.3)
+            _node.clear_pointcloud_obstacles()
+            _node.remove_basket_from_scene("basket_1")
+            _node.clear_octomap()
+            time.sleep(0.5)
+        except Exception:
+            traceback.print_exc()
+
+        return jsonify(result), 200 if result.get("success") else 500
+    finally:
+        for path in tmp_files:
             try:
-                result_item = result_queue.get(timeout=1)
-                if result_item["task_id"] == task_id:
-                    return jsonify(result_item["result"])
-                else:
-                    result_queue.put(result_item)
-            except:
+                os.unlink(path)
+            except OSError:
                 pass
 
-            if time.time() - start_time > timeout:
-                return jsonify({"success": False, "message": "任务超时"}), 504
 
-    except Exception as e:
-        return jsonify({"success": False, "message": f"更新场景失败: {str(e)}"}), 500
-
-
-@app.route('/grasp', methods=['POST'])
-def execute_grasp():
-    """执行抓取任务"""
-    global executor_node, task_queue, result_queue
-
-    if executor_node is None:
-        return jsonify({"success": False, "message": "服务未初始化"}), 503
-
-    try:
-        data = request.get_json()
-        depth_path = data.get("depth_path")
-        seg_json_path = data.get("seg_json_path")
-        affordance_path = data.get("affordance_path")
-        target_object_index = data.get("target_object_index")
-        plan_only = data.get("plan_only", False)  # 默认执行，设为True则只规划
-        return_trajectories = data.get("return_trajectories", False)  # 是否返回完整轨迹数据
-
-        if not all([depth_path, seg_json_path, affordance_path]):
-            return jsonify({"success": False, "message": "缺少必要参数: depth_path, seg_json_path, affordance_path"}), 400
-
-        # 临时切换执行模式
-        original_mode = executor_node.execution_mode
-        if plan_only:
-            executor_node.execution_mode = False
-
-        try:
-            # 生成任务ID
-            import uuid
-            task_id = str(uuid.uuid4())
-
-            # 提交任务到队列
-            task = {
-                "task_id": task_id,
-                "type": "grasp",
-                "params": {
-                    "depth_path": depth_path,
-                    "seg_json_path": seg_json_path,
-                    "affordance_path": affordance_path,
-                    "target_object_index": target_object_index,
-                    "return_trajectories": return_trajectories
-                }
-            }
-            task_queue.put(task)
-
-            # 等待结果（最多30分钟 - 考虑多个候选点的规划）
-            timeout = 1800  # 30分钟
-            start_time = time.time()
-            print(f"[Flask] 等待任务 {task_id} 的结果...")
-            while True:
-                try:
-                    result_item = result_queue.get(timeout=1)
-                    print(f"[Flask] 收到结果，task_id={result_item.get('task_id')}")
-                    if result_item["task_id"] == task_id:
-                        print(f"[Flask] 匹配成功，返回结果: {result_item['result'].get('success')}")
-                        return jsonify(result_item["result"])
-                    else:
-                        # 不是我们的结果，放回队列
-                        print(f"[Flask] task_id不匹配，放回队列")
-                        result_queue.put(result_item)
-                except Exception as e:
-                    # 队列为空或超时，继续等待
-                    if "Empty" not in str(type(e)):
-                        print(f"[Flask] 等待结果时出错: {e}")
-
-                if time.time() - start_time > timeout:
-                    print(f"[Flask] 任务 {task_id} 超时")
-                    return jsonify({"success": False, "message": "任务超时"}), 504
-
-        finally:
-            executor_node.execution_mode = original_mode
-
-    except Exception as e:
-        return jsonify({"success": False, "message": f"执行失败: {str(e)}"}), 500
-
-
-def run_grasp_pipeline(depth_path, seg_json_path, affordance_path, target_object_index=None, return_trajectories=False):
-    """执行完整的抓取流程（HTTP服务模式）"""
-    global executor_node
-
-    if executor_node is None:
-        return {"success": False, "message": "服务未初始化"}
-
-    # 使用executor_node中已经加载的配置
-    config = executor_node.config
-
-    try:
-        # 调用核心逻辑
-        results = _execute_grasp_core(
-            executor=executor_node,
-            depth_path=depth_path,
-            seg_json_path=seg_json_path,
-            affordance_path=affordance_path,
-            config=config,
-            target_object_index=target_object_index,
-            return_full_trajectories=return_trajectories
-        )
-
-        if results and results[0]["success"]:
-            return {
-                "success": True,
-                "message": "抓取任务完成",
-                "results": results
-            }
-        else:
-            return {"success": False, "message": "抓取执行失败"}
-
-    except Exception as e:
-        executor_node.get_logger().error(f"Pipeline error: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"success": False, "message": f"执行出错: {str(e)}"}
-
+# ---------------------------------------------------------------------------
+#  Entry point
+# ---------------------------------------------------------------------------
 
 def start_service(host="0.0.0.0", port=8000, robot_name="xarm7", execution_mode=True):
-    """启动HTTP服务"""
-    import socket
-
     init_ros_service(robot_name=robot_name, execution_mode=execution_mode)
 
-    # 检测端口是否可用，不可用则自动递增
     actual_port = port
     for offset in range(10):
         actual_port = port + offset
@@ -645,30 +555,26 @@ def start_service(host="0.0.0.0", port=8000, robot_name="xarm7", execution_mode=
                 break
             except OSError:
                 if offset == 0:
-                    print(f"  端口 {actual_port} 被占用，尝试其他端口...")
+                    print(f"Port {actual_port} in use, trying next...")
     else:
-        print(f"  端口 {port}-{port+9} 全部被占用，启动失败")
+        print(f"Ports {port}-{port + 9} all in use")
         return
 
     if actual_port != port:
-        print(f"  原端口 {port} 被占用，改用端口 {actual_port}")
+        print(f"Port {port} in use, using {actual_port}")
 
-    print(f"✓ HTTP服务启动在 http://{host}:{actual_port}")
-    print(f"  - 健康检查: GET  http://{host}:{actual_port}/health")
-    print(f"  - 执行抓取: POST http://{host}:{actual_port}/grasp")
+    print(f"HTTP service at http://{host}:{actual_port}")
     app.run(host=host, port=actual_port, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
-    import sys
-
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 14086
     robot_name = sys.argv[2] if len(sys.argv) > 2 else "xarm7"
-    execution_mode = True  # 默认执行模式
+    execution_mode = False
 
-    print(f"启动MoveIt服务模式...")
-    print(f"  机械臂: {robot_name}")
-    print(f"  端口: {port}")
-    print(f"  执行模式: {execution_mode}")
+    print(f"Starting MoveIt service...")
+    print(f"  Robot: {robot_name}")
+    print(f"  Port: {port}")
+    print(f"  Execution mode: {execution_mode}")
 
     start_service(port=port, robot_name=robot_name, execution_mode=execution_mode)

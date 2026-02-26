@@ -149,7 +149,7 @@ class SceneManager:
         )
 
         # ROS2 服务客户端
-        self._clear_cli = self.node.create_client(Empty, "/clear_octomap")
+        self._clear_cli = self.node.create_client(Empty, "/octomap_server/reset")
         self._apply_scene_cli = self.node.create_client(ApplyPlanningScene, "/apply_planning_scene")
 
     def update_scene(self, depth_path: str, seg_json_path: str):
@@ -504,6 +504,7 @@ def example_with_config():
     scene_mgr = SceneManager(node=parent_node, config=config)
 
     depth_path = "test_data/grasp-wrist-dpt_opt.png"
+    # depth_path = "test_data/001-dpt.png"
     seg_json_path = "test_data/rgb_detection_wrist.json"
 
     scene_mgr.update_scene(depth_path=depth_path, seg_json_path=seg_json_path)

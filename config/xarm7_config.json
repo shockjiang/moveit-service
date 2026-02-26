@@ -20,7 +20,8 @@
         "base_frame": "link_base",
         "tcp_link": "link_tcp",
         "eef_link": "link_eef",
-        "gripper_link": "link_tcp"
+        "gripper_link": "link_tcp",
+        "arm_joint_names": ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
     },
     
     "gripper": {
@@ -44,9 +45,9 @@
     },
     
     "workspace_limits": {
-        "x": [-0.3, 0.7],
+        "x": [-0.25, 0.7],
         "y": [-0.7, 0.7],
-        "z": [-0.1, 1.0]
+        "z": [-0.1, 0.8]
     },
     
     "basket": {
