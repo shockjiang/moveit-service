@@ -102,3 +102,13 @@ class GraspForwardClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+if __name__=='__main__':
+    dpt_path = 'test_data/grasp-wrist-dpt_opt.png'
+    aff_json_path = 'test_data/affordance.json'
+    seg_json_path = 'test_data/rgb_detection_wrist.json'
+    aff_json_str = json.load(open(aff_json_path, 'r'))
+    seg_json_str = json.load(open(seg_json_path, 'r'))
+    client = GraspForwardClient('http://192.168.208.30:14087')
+    result = client.forward(dpt_path, seg_json_str, aff_json_str)
+    print(result)
