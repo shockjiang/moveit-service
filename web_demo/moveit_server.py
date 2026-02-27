@@ -2,6 +2,7 @@
 """MoveIt Grasp Server — only GET / and POST /predict."""
 
 import argparse, base64, io, json, os, sys, tempfile, time, threading, traceback
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from flask import Flask, request, jsonify, abort
 from werkzeug.datastructures import FileStorage
 import rclpy
@@ -100,8 +101,10 @@ def predict():
         servo_dt = params.pop("servo_dt", None)
         if r != _robot: _init(r, _exec_mode)
         if not _node: abort(503, "Not initialized")
-        # Pre-cleanup
-        _node.detach_object(); _node.clear_pointcloud_obstacles(); _node.clear_octomap()
+        # Pre-cleanup (sleep 等待 planning scene 同步)
+        _node.detach_object(); time.sleep(0.3)
+        _node.clear_pointcloud_obstacles()
+        _node.clear_octomap(); time.sleep(0.5)
         # Call core directly — params passed in, core handles priority
         orig = _node.execution_mode
         if params.get("plan_only"): _node.execution_mode = False
@@ -116,8 +119,10 @@ def predict():
         finally:
             _node.execution_mode = orig
         # Post-cleanup
-        _node.detach_object(); _node.clear_pointcloud_obstacles()
-        _node.remove_basket_from_scene("basket_1"); _node.clear_octomap()
+        _node.detach_object(); time.sleep(0.3)
+        _node.clear_pointcloud_obstacles()
+        _node.remove_basket_from_scene("basket_1")
+        _node.clear_octomap(); time.sleep(0.5)
         # Format — servo_dt 不为 None 时做插值重采样
         result = format_grasp_result(results, dt=servo_dt)
         return jsonify(result), 200 if result.get("success") else 500

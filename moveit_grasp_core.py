@@ -1343,11 +1343,17 @@ def _execute_grasp_core(
         executor.camera_params.update(camera)
         executor.config.setdefault("camera", {}).update(camera)
 
-    # basket center: target_pos(框子中心) > config > default
+    # basket: target_pos 的 x,y 定位框子，z 自动算（底面贴桌面）
+    basket_size = basket_cfg.get("outer_size", [0.3, 0.2, 0.15])
+    default_center = basket_cfg.get("center", [0.4, 0.3, 0.1])
+    if target_pos:
+        basket_center = [target_pos[0], target_pos[1], basket_size[2] / 2]
+    else:
+        basket_center = default_center
     basket = {
         "id": basket_cfg.get("default_id", "basket_1"),
-        "center": target_pos[:3] if target_pos else basket_cfg.get("center", [0.4, 0.3, 0.1]),
-        "size": basket_cfg.get("outer_size", [0.3, 0.2, 0.15])
+        "center": basket_center,
+        "size": basket_size
     }
 
     home_joints = home_config.get("joints", [0.0] * 7)

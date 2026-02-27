@@ -71,8 +71,8 @@
 | objs | string 或 list | Y | 物体 affordance 数据，含 mask/bbox/score/affs |
 | seg_json | string 或 dict | Y | 检测分割数据 |
 | start_pos | float[6] | Y | 起始位姿 [x,y,z,roll,pitch,yaw]，其中 [3:] 作为抓取姿态基准 |
-| target_pos | float[6] | Y | 放置框中心 [x,y,z,roll,pitch,yaw]，[:3] 作为 carrying 目标 |
-| end_pos | float[6] | Y | 结束位姿 [x,y,z,roll,pitch,yaw]，returning 阶段目标（不一定等于 start_pos） |
+| target_pos | float[6] | Y | 放置框位姿 [x,y,z,roll,pitch,yaw]，[:2] 定位篮子 x,y（z 自动算，底面贴桌面） |
+| end_pos | float[6] | Y | 结束位姿 [x,y,z,roll,pitch,yaw]，returning 阶段机械臂回到哪里 |
 | target_object_index | int | N | 指定抓哪个物体，-1 或不传则自动选最优 |
 | execution_simulation | bool | N | true(默认)=仅规划，false=规划+真机执行 |
 | servo_dt | float | N | 伺服模式插值步长（秒）。传入后做三次 Hermite 样条插值重采样。推荐 0.02 (50Hz) |
@@ -158,8 +158,8 @@ server 传入的参数优先于 config 文件中的默认值：
 |---------|-----------------|------|
 | camera | config.camera | 相机标定参数 |
 | start_pos[3:] | config.home.orientation | 抓取姿态基准 (roll,pitch,yaw) |
-| target_pos[:3] | config.basket.center | 放置框中心坐标 |
-| end_pos | config.home.joints (fallback) | returning 阶段终点 |
+| target_pos[:2] | config.basket.center (x,y) | 放置框 x,y 坐标（z = basket_height/2，底面贴桌面） |
+| end_pos | config.home.joints (fallback) | returning 阶段终点（笛卡尔位姿） |
 
 ---
 
