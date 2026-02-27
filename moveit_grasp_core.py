@@ -1023,7 +1023,8 @@ class GraspExecutor(Node):
         place_clearance: float = 0.05,
         grasp_pose_base: Sequence[float] = (-np.pi, 0.0, 0.0),
         gripper_close_tightness: float = 0.02,
-        home_joints: Optional[List[float]] = None
+        home_joints: Optional[List[float]] = None,
+        end_pos: Optional[List[float]] = None
     ) -> Dict[str, Any]:
         instance_id = best_candidate["instance_id"]
         grasp_z = best_candidate["center"][2]
@@ -1154,13 +1155,19 @@ class GraspExecutor(Node):
             object_attached = False
             time.sleep(0.3)
 
-            # return: 回到 HOME
-            return_goal = self.build_joint_goal(
-                joint_positions=home_joints or [0.0] * 7,
-                drive_joint_rad=self.gripper_joint_max,
-                allowed_time=300.0, planner_id="RRTConnect",
-                start_joint_state=current_joint_state
-            )
+            # return: end_pos(笛卡尔) > home_joints(关节) > default
+            if end_pos:
+                return_goal = self.build_goal(
+                    xyz=end_pos[:3], rpy=end_pos[3:],
+                    drive_joint_rad=self.gripper_joint_max,
+                    start_joint_state=current_joint_state,
+                    planner_id="RRTConnect", allowed_time=300.0)
+            else:
+                return_goal = self.build_joint_goal(
+                    joint_positions=home_joints or [0.0] * 7,
+                    drive_joint_rad=self.gripper_joint_max,
+                    allowed_time=300.0, planner_id="RRTConnect",
+                    start_joint_state=current_joint_state)
             result_msg = self._send_action_goal(
                 self.move_action_client, return_goal,
                 send_timeout=15.0, result_timeout=310.0, label="[Returning]")
@@ -1239,6 +1246,76 @@ def _build_execution_steps(full_result: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     return steps
 
+def interpolate_trajectory(points, dt=0.02):
+    """将稀疏 MoveIt 轨迹点用三次 Hermite 样条插值，按固定 dt 重采样。
+    Args:
+        points: _trajectory_to_json 输出的 points 列表，含 positions/velocities/time_from_start
+        dt: 目标时间步长（秒），默认 0.02s = 50Hz
+    Returns:
+        dict with positions, velocities, accelerations, dt, duration
+    """
+    from scipy.interpolate import CubicHermiteSpline
+
+    if len(points) < 2:
+        return {
+            "positions":     [p["positions"] for p in points],
+            "velocities":    [p.get("velocities", []) for p in points],
+            "accelerations": [p.get("accelerations", []) for p in points],
+            "dt": dt}
+
+    # 提取时间轴
+    times = np.array([p["time_from_start"]["sec"] + p["time_from_start"]["nanosec"] * 1e-9
+                       for p in points])
+    n_joints = len(points[0]["positions"])
+    pos = np.array([p["positions"] for p in points])
+    vel = np.array([p.get("velocities", [0.0] * n_joints) for p in points])
+
+    # 按固定 dt 生成新时间轴
+    t_new = np.arange(times[0], times[-1], dt)
+    if len(t_new) == 0 or t_new[-1] < times[-1]:
+        t_new = np.append(t_new, times[-1])
+
+    # 逐关节插值
+    new_pos = np.zeros((len(t_new), n_joints))
+    new_vel = np.zeros((len(t_new), n_joints))
+    new_acc = np.zeros((len(t_new), n_joints))
+    for j in range(n_joints):
+        cs = CubicHermiteSpline(times, pos[:, j], vel[:, j])
+        new_pos[:, j] = cs(t_new)
+        new_vel[:, j] = cs(t_new, 1)
+        new_acc[:, j] = cs(t_new, 2)
+
+    return {
+        "positions":     new_pos.tolist(),
+        "velocities":    new_vel.tolist(),
+        "accelerations": new_acc.tolist(),
+        "dt": dt,
+        "duration": float(times[-1] - times[0])}
+
+def format_grasp_result(results, dt=None):
+    """Format _execute_grasp_core output for HTTP API response.
+    dt 不为 None 时，对每段轨迹做插值重采样（单位：秒，推荐 0.02 = 50Hz）。
+    """
+    if not results or not results[0].get("success"):
+        return {"success": False, "message": "Grasp planning failed"}
+    best = results[0]
+    traj = {}
+    for s in best.get("execution_steps", []):
+        if s.get("action") == "execute_trajectory":
+            pts = s["trajectory"].get("points", [])
+            if dt and len(pts) >= 2:
+                traj[s["label"]] = interpolate_trajectory(pts, dt)
+            else:
+                traj[s["label"]] = {
+                    "positions":     [p["positions"] for p in pts],
+                    "velocities":    [p.get("velocities", []) for p in pts],
+                    "accelerations": [p.get("accelerations", []) for p in pts]}
+    iid = best.get("instance_id", "")
+    try:    idx = int(iid.split("_")[-1])
+    except: idx = -1
+    return {"success": True, "obj_index": idx, "instance_id": iid,
+            "trajectory": traj, "planning_time": best.get("planning_time", 0)}
+
 def _execute_grasp_core(
     executor: GraspExecutor,
     depth_path: str,
@@ -1246,18 +1323,30 @@ def _execute_grasp_core(
     affordance_path: str,
     config: Dict[str, Any],
     target_object_index: Optional[int] = None,
-    return_full_trajectories: bool = False
+    return_full_trajectories: bool = False,
+    camera: Optional[Dict[str, Any]] = None,
+    start_pos: Optional[List[float]] = None,
+    end_pos: Optional[List[float]] = None,
+    target_pos: Optional[List[float]] = None,
 ) -> List[Dict[str, Any]]:
-    """核心抓取逻辑（可被命令行和HTTP服务复用）"""
+    """核心抓取逻辑（可被命令行和HTTP服务复用）
+    参数优先级：直接传入 > config 字典 > 默认值
+    """
     results = []
 
     home_config = config.get("home", {})
     basket_cfg = config.get("basket", {})
     grasp_cfg = config.get("grasp", {})
 
+    # camera: 传入 > executor 已有
+    if camera:
+        executor.camera_params.update(camera)
+        executor.config.setdefault("camera", {}).update(camera)
+
+    # basket center: target_pos(框子中心) > config > default
     basket = {
         "id": basket_cfg.get("default_id", "basket_1"),
-        "center": basket_cfg.get("center", [0.4, 0.3, 0.1]),
+        "center": target_pos[:3] if target_pos else basket_cfg.get("center", [0.4, 0.3, 0.1]),
         "size": basket_cfg.get("outer_size", [0.3, 0.2, 0.15])
     }
 
@@ -1313,7 +1402,9 @@ def _execute_grasp_core(
             executor.get_logger().error("No valid grasp candidates")
             return results
 
-        grasp_pose_base = tuple(home_config["orientation"])
+        # grasp_pose_base: 传入 > config > default
+        grasp_pose_base = tuple(start_pos[3:]) if start_pos \
+            else tuple(home_config.get("orientation", (-np.pi, 0.0, 0.0)))
         ranked_results = executor.plan_rank_all_candidates(
             all_candidates,
             grasp_pose=grasp_pose_base,
@@ -1341,7 +1432,8 @@ def _execute_grasp_core(
             best_candidate=best, basket=basket,
             place_clearance=place_clearance,
             grasp_pose_base=grasp_pose_base,
-            home_joints=home_joints
+            home_joints=home_joints,
+            end_pos=end_pos
         )
         seq_time = time.perf_counter() - t0
 
