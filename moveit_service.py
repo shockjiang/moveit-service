@@ -236,7 +236,7 @@ def _shutdown_ros():
     time.sleep(1.0)
 
 
-def init_ros_service(robot_name, execution_mode=True):
+def init_ros_service(robot_name, execution_mode=False):
     global _node, _task_queue, _result_queue, _ros_exec, _worker_thread
     global _current_robot, _execution_mode
 
@@ -542,7 +542,7 @@ def forward():
 #  Entry point
 # ---------------------------------------------------------------------------
 
-def start_service(host="0.0.0.0", port=8000, robot_name="xarm7", execution_mode=True):
+def start_service(host="0.0.0.0", port=8000, robot_name="xarm7", execution_mode=False):
     init_ros_service(robot_name=robot_name, execution_mode=execution_mode)
 
     actual_port = port
