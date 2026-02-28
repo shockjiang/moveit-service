@@ -862,7 +862,7 @@ class GraspExecutor(Node):
         planner_id: Optional[str] = None,
         start_joint_state: Optional[List[float]] = None,
         pos_tol: float = 0.01,
-        ori_tol: float = 0.1
+        ori_tol: float = 0.01
     ) -> Optional[Dict[str, Any]]:
         surface_center = aff["center"]
         gripper_width = float(aff["boundingbox"]["width"]) + float(aff.get("extra_open", 0.0))
@@ -983,7 +983,7 @@ class GraspExecutor(Node):
         start_joint_state: Optional[List[float]] = None,
         start_xyz: Optional[Sequence[float]] = None,
         pos_tol: float = 0.01,
-        ori_tol: float = 0.1
+        ori_tol: float = 0.01
     ) -> List[Dict[str, Any]]:
         results = []
         t0 = time.perf_counter()
@@ -1069,7 +1069,7 @@ class GraspExecutor(Node):
         home_joints: Optional[List[float]] = None,
         end_pos: Optional[List[float]] = None,
         pos_tol: float = 0.01,
-        ori_tol: float = 0.1
+        ori_tol: float = 0.01
     ) -> Dict[str, Any]:
         instance_id = best_candidate["instance_id"]
         grasp_z = best_candidate["center"][2]
@@ -1447,7 +1447,7 @@ def _execute_grasp_core(
 
     # 容差: 传入 > config > 默认值
     _pos_tol = pos_tol if pos_tol is not None else grasp_cfg.get("pos_tol", 0.01)
-    _ori_tol = ori_tol if ori_tol is not None else grasp_cfg.get("ori_tol", 0.1)
+    _ori_tol = ori_tol if ori_tol is not None else grasp_cfg.get("ori_tol", 0.01)
 
     try:
         if executor.execution_mode:
