@@ -252,7 +252,7 @@ class GraspExecutor(Node):
             ps.world.collision_objects.append(wall)
             oc = ObjectColor()
             oc.id = wall.id
-            oc.color = ColorRGBA(r=0.0, g=0.0, b=0.0, a=0.0)
+            oc.color = ColorRGBA(r=55.0, g=1.0, b=1.0, a=0.0)
             ps.object_colors.append(oc)
         self.scene_pub.publish(ps)
 
@@ -643,11 +643,12 @@ class GraspExecutor(Node):
         rpy: Sequence[float],
         drive_joint_rad: float,
         pos_tol: float = 0.01,
-        ori_tol: float = 0.1,
+        ori_tol: float = 0.01,
         allowed_time: float = 10.0,
         planner_id: Optional[str] = None,
         start_joint_state: Optional[List[float]] = None,
-        plan_only: bool = True
+        plan_only: bool = True,
+        num_planning_attempts: int = 1
     ) -> MoveGroup.Goal:
         x, y, z = map(float, xyz)
         roll, pitch, yaw = map(float, rpy)
@@ -658,6 +659,7 @@ class GraspExecutor(Node):
 
         req.group_name = self.planning_group
         req.allowed_planning_time = float(allowed_time)
+        req.num_planning_attempts = int(num_planning_attempts)
         if planner_id:
             req.planner_id = planner_id
 
@@ -718,12 +720,14 @@ class GraspExecutor(Node):
         allowed_time: float = 30.0,
         planner_id: Optional[str] = None,
         start_joint_state: Optional[List[float]] = None,
-        plan_only: bool = True
+        plan_only: bool = True,
+        num_planning_attempts: int = 1
     ) -> MoveGroup.Goal:
         goal = MoveGroup.Goal()
         req = goal.request
         req.group_name = self.planning_group
         req.allowed_planning_time = float(allowed_time)
+        req.num_planning_attempts = int(num_planning_attempts)
 
         if planner_id:
             req.planner_id = planner_id
@@ -770,9 +774,10 @@ class GraspExecutor(Node):
         self,
         obj,
         w_len: float = 30.0,
-        w_time: float = 20.0,
-        w_j: float = 0.01,
-        eps: float = 1e-12
+        w_time: float = 2.0,
+        w_j: float = 1.0,
+        eps: float = 1e-12,
+        cartesian_dist: float = 0.0
     ) -> Dict[str, Any]:
         traj = getattr(obj, "planned_trajectory", obj)
         jt = getattr(traj, "joint_trajectory", None)
@@ -795,7 +800,9 @@ class GraspExecutor(Node):
                 da = np.diff(acc, axis=0)
                 J = float(np.sum(np.sum(da**2, axis=1)[valid] / dt[valid]))
 
-        cost = float(w_len * L + w_time * T + (w_j * J if has_acc else 0.0))
+        # 路径长度项：有笛卡尔直线距离时用比值（归一化），否则用绝对值
+        L_norm = L / max(cartesian_dist, eps) if cartesian_dist > 0 else L
+        cost = float(w_len * L_norm + w_time * T + (w_j * J if has_acc else 0.0))
         return {"cost": cost,
                 "metrics": {"ok": True, "path_len": L, "time": T, "jerk": J}}
 
@@ -853,7 +860,9 @@ class GraspExecutor(Node):
         aff: Dict[str, Any],
         grasp_pose: Sequence[float],
         planner_id: Optional[str] = None,
-        start_joint_state: Optional[List[float]] = None
+        start_joint_state: Optional[List[float]] = None,
+        pos_tol: float = 0.01,
+        ori_tol: float = 0.1
     ) -> Optional[Dict[str, Any]]:
         surface_center = aff["center"]
         gripper_width = float(aff["boundingbox"]["width"]) + float(aff.get("extra_open", 0.0))
@@ -901,9 +910,11 @@ class GraspExecutor(Node):
             xyz=pregrasp_center,
             rpy=pregrasp_pose,
             drive_joint_rad=drive_joint_rad,
-            allowed_time=300.0,  # 5分钟规划时间
+            allowed_time=300.0,
             planner_id=planner_id,
-            start_joint_state=current_state
+            start_joint_state=current_state,
+            pos_tol=pos_tol,
+            ori_tol=ori_tol
         )
 
         if not self.move_action_client.server_is_ready():
@@ -944,7 +955,8 @@ class GraspExecutor(Node):
                 xyz=center, rpy=adjusted_grasp_pose,
                 drive_joint_rad=drive_joint_rad,
                 allowed_time=300.0, planner_id=planner_id,
-                start_joint_state=current_state
+                start_joint_state=current_state,
+                pos_tol=pos_tol, ori_tol=ori_tol
             )
             grasp_result = self._send_action_goal(
                 self.move_action_client, grasp_goal,
@@ -967,23 +979,54 @@ class GraspExecutor(Node):
         self,
         grasp_candidates: List[Dict[str, Any]],
         grasp_pose: Sequence[float],
-        planner_id: str = "RRTConnect",
-        start_joint_state: Optional[List[float]] = None
+        planner_id: str = "RRTstart",
+        start_joint_state: Optional[List[float]] = None,
+        start_xyz: Optional[Sequence[float]] = None,
+        pos_tol: float = 0.01,
+        ori_tol: float = 0.1
     ) -> List[Dict[str, Any]]:
         results = []
         t0 = time.perf_counter()
+        cur_removed = None  # 当前被移除的 instance_id
 
         for aff in grasp_candidates:
+            iid = aff.get("instance_id", "")
+
+            # 只移除当前候选对应的物体，其他物体保留碰撞检测
+            if iid != cur_removed:
+                # 恢复上一个
+                if cur_removed and self.scene_manager and cur_removed in self.scene_manager.processed_meshes:
+                    self.scene_manager._apply_collision_meshes(
+                        [(cur_removed, self.scene_manager.processed_meshes[cur_removed])])
+                # 移除当前
+                if iid:
+                    self.remove_object_from_scene(iid)
+                    time.sleep(0.2)
+                cur_removed = iid
+
             t_cand = time.perf_counter()
             r = self.plan_candidate(aff, grasp_pose=grasp_pose,
-                planner_id=planner_id, start_joint_state=start_joint_state)
+                planner_id=planner_id, start_joint_state=start_joint_state,
+                pos_tol=pos_tol, ori_tol=ori_tol)
             if r is not None:
                 r['candidate_planning_time'] = time.perf_counter() - t_cand
                 main_traj = r["pregrasp_trajectory"]
-                cost_info = self.trajectory_cost(main_traj)
+                # 笛卡尔直线距离，用于归一化路径长度项
+                if start_xyz is not None and "pregrasp_center" in r:
+                    straight = float(np.linalg.norm(
+                        np.array(r["pregrasp_center"]) - np.array(start_xyz)))
+                else:
+                    straight = 0.0
+                cost_info = self.trajectory_cost(main_traj, cartesian_dist=straight)
                 r['cost'] = cost_info['cost']
                 r['cost_metrics'] = cost_info['metrics']
+
                 results.append(r)
+
+        # 恢复最后一个被移除的物体
+        if cur_removed and self.scene_manager and cur_removed in self.scene_manager.processed_meshes:
+            self.scene_manager._apply_collision_meshes(
+                [(cur_removed, self.scene_manager.processed_meshes[cur_removed])])
 
         planning_time = time.perf_counter() - t0
         self.get_logger().info(f"[Approaching] Planning complete: {len(results)}/{len(grasp_candidates)} succeeded "
@@ -1024,7 +1067,9 @@ class GraspExecutor(Node):
         grasp_pose_base: Sequence[float] = (-np.pi, 0.0, 0.0),
         gripper_close_tightness: float = 0.02,
         home_joints: Optional[List[float]] = None,
-        end_pos: Optional[List[float]] = None
+        end_pos: Optional[List[float]] = None,
+        pos_tol: float = 0.01,
+        ori_tol: float = 0.1
     ) -> Dict[str, Any]:
         instance_id = best_candidate["instance_id"]
         grasp_z = best_candidate["center"][2]
@@ -1114,24 +1159,38 @@ class GraspExecutor(Node):
             if self.execution_mode:
                 time.sleep(0.3)
 
-            # carry: 搬运到放置点
+            # carry: 搬运到放置点（笛卡尔优先，碰撞时退化到采样规划）
             place_z = grasp_z + basket["size"][2] + place_clearance
-            carry_goal = self.build_goal(
-                xyz=[basket["center"][0], basket["center"][1], place_z],
-                rpy=(-np.pi, 0.0, 0.0),
-                drive_joint_rad=close_rad,
-                start_joint_state=current_joint_state,
-                planner_id="RRTConnect", allowed_time=300.0,
-                pos_tol=0.02, ori_tol=0.2
-            )
-            result_msg = self._send_action_goal(
-                self.move_action_client, carry_goal,
-                send_timeout=15.0, result_timeout=310.0, label="[Carrying]")
-            if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
-                self.get_logger().error("[Carrying] Planning failed")
-                return result
-            carry_traj = result_msg.result.planned_trajectory
-            current_joint_state = self.extract_final_joint_state(carry_traj)
+            carry_pose = Pose()
+            carry_pose.position = Point(
+                x=float(basket["center"][0]),
+                y=float(basket["center"][1]),
+                z=float(place_z))
+            carry_quat = R.from_euler("xyz", [-np.pi, 0.0, 0.0], degrees=False).as_quat()
+            carry_pose.orientation = Quaternion(
+                x=float(carry_quat[0]), y=float(carry_quat[1]),
+                z=float(carry_quat[2]), w=float(carry_quat[3]))
+
+            carry_result = self.plan_cartesian_path(
+                waypoints=[carry_pose], start_joint_state=current_joint_state,
+                drive_joint_rad=close_rad, max_step=0.01, avoid_collisions=True)
+            if carry_result is None:
+                self.get_logger().info("[Carrying] Cartesian failed, falling back to RRTstart")
+                carry_goal = self.build_goal(
+                    xyz=[basket["center"][0], basket["center"][1], place_z],
+                    rpy=(-np.pi, 0.0, 0.0), drive_joint_rad=close_rad,
+                    start_joint_state=current_joint_state,
+                    planner_id="RRTstart", allowed_time=30.0,
+                    num_planning_attempts=5, pos_tol=pos_tol, ori_tol=ori_tol)
+                result_msg = self._send_action_goal(
+                    self.move_action_client, carry_goal,
+                    send_timeout=15.0, result_timeout=40.0, label="[Carrying]")
+                if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
+                    self.get_logger().error("[Carrying] Planning failed")
+                    return result
+                carry_result = (result_msg.result.planned_trajectory,
+                                self.extract_final_joint_state(result_msg.result.planned_trajectory))
+            carry_traj, current_joint_state = carry_result
             if current_joint_state is None:
                 self.get_logger().error("[Carrying] Failed to extract final state")
                 return result
@@ -1155,26 +1214,50 @@ class GraspExecutor(Node):
             object_attached = False
             time.sleep(0.3)
 
-            # return: end_pos(笛卡尔) > home_joints(关节) > default
+            # return: 笛卡尔优先 → 采样退化
             if end_pos:
-                return_goal = self.build_goal(
-                    xyz=end_pos[:3], rpy=end_pos[3:],
-                    drive_joint_rad=self.gripper_joint_max,
-                    start_joint_state=current_joint_state,
-                    planner_id="RRTConnect", allowed_time=300.0)
+                return_pose = Pose()
+                return_pose.position = Point(
+                    x=float(end_pos[0]), y=float(end_pos[1]), z=float(end_pos[2]))
+                ret_quat = R.from_euler("xyz", list(end_pos[3:]), degrees=False).as_quat()
+                return_pose.orientation = Quaternion(
+                    x=float(ret_quat[0]), y=float(ret_quat[1]),
+                    z=float(ret_quat[2]), w=float(ret_quat[3]))
+
+                return_result = self.plan_cartesian_path(
+                    waypoints=[return_pose], start_joint_state=current_joint_state,
+                    drive_joint_rad=self.gripper_joint_max, max_step=0.01, avoid_collisions=True)
+                if return_result is None:
+                    self.get_logger().info("[Returning] Cartesian failed, falling back to RRTstart")
+                    return_goal = self.build_goal(
+                        xyz=end_pos[:3], rpy=end_pos[3:],
+                        drive_joint_rad=self.gripper_joint_max,
+                        start_joint_state=current_joint_state,
+                        planner_id="RRTstart", allowed_time=30.0,
+                        num_planning_attempts=5, pos_tol=pos_tol, ori_tol=ori_tol)
+                    result_msg = self._send_action_goal(
+                        self.move_action_client, return_goal,
+                        send_timeout=15.0, result_timeout=40.0, label="[Returning]")
+                    if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
+                        self.get_logger().error("[Returning] Planning failed")
+                        return result
+                    result["trajectories"]["returning"] = result_msg.result.planned_trajectory
+                else:
+                    result["trajectories"]["returning"] = return_result[0]
             else:
                 return_goal = self.build_joint_goal(
                     joint_positions=home_joints or [0.0] * 7,
                     drive_joint_rad=self.gripper_joint_max,
-                    allowed_time=300.0, planner_id="RRTConnect",
-                    start_joint_state=current_joint_state)
-            result_msg = self._send_action_goal(
-                self.move_action_client, return_goal,
-                send_timeout=15.0, result_timeout=310.0, label="[Returning]")
-            if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
-                self.get_logger().error("[Returning] Planning failed")
-                return result
-            result["trajectories"]["returning"] = result_msg.result.planned_trajectory
+                    allowed_time=30.0, planner_id="RRTstart",
+                    start_joint_state=current_joint_state,
+                    num_planning_attempts=5)
+                result_msg = self._send_action_goal(
+                    self.move_action_client, return_goal,
+                    send_timeout=15.0, result_timeout=40.0, label="[Returning]")
+                if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
+                    self.get_logger().error("[Returning] Planning failed")
+                    return result
+                result["trajectories"]["returning"] = result_msg.result.planned_trajectory
 
             if not self.execute_trajectory(result["trajectories"]["returning"]):
                 self.get_logger().error("[Returning] Execution failed")
@@ -1314,6 +1397,8 @@ def format_grasp_result(results, dt=None):
     try:    idx = int(iid.split("_")[-1])
     except: idx = -1
     return {"success": True, "obj_index": idx, "instance_id": iid,
+            "grasp_center_3d": best.get("grasp_center_3d"),
+            "pregrasp_center_3d": best.get("pregrasp_center_3d"),
             "trajectory": traj, "planning_time": best.get("planning_time", 0)}
 
 def _execute_grasp_core(
@@ -1328,6 +1413,8 @@ def _execute_grasp_core(
     start_pos: Optional[List[float]] = None,
     end_pos: Optional[List[float]] = None,
     target_pos: Optional[List[float]] = None,
+    pos_tol: Optional[float] = None,
+    ori_tol: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """核心抓取逻辑（可被命令行和HTTP服务复用）
     参数优先级：直接传入 > config 字典 > 默认值
@@ -1358,12 +1445,16 @@ def _execute_grasp_core(
 
     home_joints = home_config.get("joints", [0.0] * 7)
 
+    # 容差: 传入 > config > 默认值
+    _pos_tol = pos_tol if pos_tol is not None else grasp_cfg.get("pos_tol", 0.01)
+    _ori_tol = ori_tol if ori_tol is not None else grasp_cfg.get("ori_tol", 0.1)
+
     try:
         if executor.execution_mode:
             goal = executor.build_joint_goal(
                 joint_positions=home_joints,
                 drive_joint_rad=executor.gripper_joint_max,
-                allowed_time=30.0, planner_id="RRTConnect"
+                allowed_time=30.0, planner_id="RRTstart"
             )
             result_msg = executor._send_action_goal(
                 executor.move_action_client, goal,
@@ -1406,20 +1497,27 @@ def _execute_grasp_core(
 
         if not all_candidates:
             executor.get_logger().error("No valid grasp candidates")
+            print(f"[DIAG] parse_affordances_to_candidates returned 0 candidates for obj_index={target_object_index}")
             return results
+
+        print(f"[DIAG] {len(all_candidates)} candidates generated for obj_index={target_object_index}")
 
         # grasp_pose_base: 传入 > config > default
         grasp_pose_base = tuple(start_pos[3:]) if start_pos \
             else tuple(home_config.get("orientation", (-np.pi, 0.0, 0.0)))
+        start_xyz = start_pos[:3] if start_pos else home_config.get("position", [0.27, 0.0, 0.307])
         ranked_results = executor.plan_rank_all_candidates(
             all_candidates,
             grasp_pose=grasp_pose_base,
-            planner_id="RRTConnect",
-            start_joint_state=executor.current_joint_state
+            planner_id="RRTstart",
+            start_joint_state=executor.current_joint_state,
+            start_xyz=start_xyz,
+            pos_tol=_pos_tol, ori_tol=_ori_tol
         )
 
         if not ranked_results:
             executor.get_logger().error("All candidates failed planning")
+            print(f"[DIAG] plan_rank_all_candidates returned 0 results (all {len(all_candidates)} candidates failed)")
             return results
 
         place_clearance = grasp_cfg.get("place_clearance", -0.02)
@@ -1433,15 +1531,20 @@ def _execute_grasp_core(
                 seen.add(c["instance_id"])
 
         best = unique_candidates[0]
+        print(f"[DIAG] Best candidate: id={best.get('instance_id')}, "
+              f"center={best.get('center')}, score={best.get('score')}")
         t0 = time.perf_counter()
         full_result = executor.execute_complete_grasp_sequence(
             best_candidate=best, basket=basket,
             place_clearance=place_clearance,
             grasp_pose_base=grasp_pose_base,
             home_joints=home_joints,
-            end_pos=end_pos
+            end_pos=end_pos,
+            pos_tol=_pos_tol, ori_tol=_ori_tol
         )
         seq_time = time.perf_counter() - t0
+        print(f"[DIAG] execute_complete_grasp_sequence: success={full_result.get('success')}, "
+              f"time={seq_time:.2f}s, steps={len(full_result.get('trajectories', {}))}")
 
         trajs = full_result["trajectories"]
         result = {
@@ -1449,6 +1552,8 @@ def _execute_grasp_core(
             "success": full_result["success"],
             "planning_time": seq_time,
             "rank": 1,
+            "grasp_center_3d": best.get("center"),
+            "pregrasp_center_3d": best.get("pregrasp_center"),
             "approaching_trajectory": _trajectory_to_json(trajs.get("approaching")),
             "carrying_trajectory": _trajectory_to_json(trajs.get("carrying")),
             "returning_trajectory": _trajectory_to_json(trajs.get("returning"))

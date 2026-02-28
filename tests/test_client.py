@@ -70,7 +70,7 @@ def main():
 
     # 健康检查 GET /
     try:
-        resp = requests.get(f"{base_url}/", timeout=5)
+        resp = requests.get(f"{base_url}/health", timeout=5)
         health = resp.json()
         print(f"Health: {health}")
         srv_robot = health.get("robot", "")
