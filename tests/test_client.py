@@ -3,7 +3,8 @@
 Grasp Client — 适配 moveit_server.py (GET / + POST /predict)
 
 Usage:
-    python test_client.py                                          # 默认参数
+    python test_client.py                                          # 默认(仅规划)
+    python test_client.py --execute                                # 规划+执行
     python test_client.py --host 192.168.1.100 --port 14086        # 远程主机
     python test_client.py --target 3 --servo-dt 0.02               # 指定目标+插值
 """
@@ -43,6 +44,8 @@ def main():
                              "extrinsics": {"translation": [0.325, 0.028, 0.658],
                                             "quaternion": [-0.703, 0.71, -0.026, 0.021]}},
                     help="相机内外参 JSON")
+    pa.add_argument("--plan-only", action="store_true",
+                    help="仅规划不执行 (默认执行)")
     pa.add_argument("--servo-dt", type=float, default=None,
                     help="伺服插值步长(秒), 如 0.02=50Hz, 不指定则返回原始点")
     pa.add_argument("--output-dir", default="data/out", help="输出目录 (default: data/out)")
@@ -53,8 +56,10 @@ def main():
     print("=" * 50)
     print("Grasp Client (moveit_server.py)")
     print("=" * 50)
+    mode = "PLAN ONLY" if a.plan_only else "EXECUTE"
     print(f"  Server:    {base_url}")
     print(f"  Robot:     {a.robot}")
+    print(f"  Mode:      {mode}")
     print(f"  Target:    {a.target}")
     print(f"  Servo dt:  {a.servo_dt}")
     print(f"  Depth:     {a.depth}")
@@ -93,12 +98,14 @@ def main():
         "target_pos": a.target_pos,
         "end_pos": a.end_pos,
     }
+    payload["execution_simulation"] = a.plan_only
     if a.target is not None and a.target >= 0:
         payload["target_object_index"] = a.target
     if a.servo_dt:
         payload["servo_dt"] = a.servo_dt
 
-    print(f"\nPOST {base_url}/predict ...")
+    print(f"\n  execution_simulation={payload['execution_simulation']}")
+    print(f"POST {base_url}/predict ...")
     try:
         resp = requests.post(f"{base_url}/predict", json=payload, timeout=1800)
     except requests.exceptions.ConnectionError:

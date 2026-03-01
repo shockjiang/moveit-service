@@ -149,18 +149,18 @@ def launch_setup(context, *_args, **_kwargs):
                 'RRT': {
                     'type': 'geometric::RRT',
                     'range': 0.0,
-                    'goal_bias': 0.05
+                    'goal_bias': 0.15
                 },
                 'RRTstar': {
                     'type': 'geometric::RRTstar',
                     'range': 0.0,
-                    'goal_bias': 0.05,
+                    'goal_bias': 0.15,
                     'delay_collision_checking': 1
                 },
                 'TRRT': {
                     'type': 'geometric::TRRT',
                     'range': 0.0,
-                    'goal_bias': 0.05
+                    'goal_bias': 0.15
                 },
                 'PRM': {
                     'type': 'geometric::PRM',
@@ -176,7 +176,7 @@ def launch_setup(context, *_args, **_kwargs):
                 'EST': {
                     'type': 'geometric::EST',
                     'range': 0.0,
-                    'goal_bias': 0.05
+                    'goal_bias': 0.15
                 },
                 'LBKPIECE': {
                     'type': 'geometric::LBKPIECE',
@@ -194,15 +194,26 @@ def launch_setup(context, *_args, **_kwargs):
                 'KPIECE': {
                     'type': 'geometric::KPIECE',
                     'range': 0.0,
-                    'goal_bias': 0.05,
+                    'goal_bias': 0.15,
                     'border_fraction': 0.9,
                     'failed_expansion_score_factor': 0.5,
                     'min_valid_path_fraction': 0.5
+                },
+                'ABITstar': {
+                    'type': 'geometric::ABITstar'
+                },
+                'BITstar': {
+                    'type': 'geometric::BITstar'
+                },
+                'InformedRRTstar': {
+                    'type': 'geometric::InformedRRTstar',
+                    'range': 0.0,
+                    'goal_bias': 0.15
                 }
             },
             'xarm7': {
                 'default_planner_config': 'RRTConnect',
-                'planner_configs': ['SBL', 'EST', 'LBKPIECE', 'BKPIECE', 'KPIECE', 'RRT', 'RRTConnect', 'RRTstar', 'TRRT', 'PRM', 'PRMstar']
+                'planner_configs': ['SBL', 'EST', 'LBKPIECE', 'BKPIECE', 'KPIECE', 'RRT', 'RRTConnect', 'RRTstar', 'TRRT', 'PRM', 'PRMstar', 'ABITstar', 'BITstar', 'InformedRRTstar']
             },
             'xarm_gripper': {
                 'default_planner_config': 'RRTConnect',

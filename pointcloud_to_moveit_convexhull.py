@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import time
 import numpy as np
 import cv2
 import rclpy
@@ -157,11 +158,11 @@ class SceneManager:
         if self._clear_cli.wait_for_service(timeout_sec=2.0):
             try:
                 future = self._clear_cli.call_async(Empty.Request())
-                # 等待 clear 完成
+                # 等待 clear 完成（node 已由 executor spin，不再手动 spin_once）
                 timeout_sec = 5.0
                 start = self.node.get_clock().now()
                 while not future.done():
-                    rclpy.spin_once(self.node, timeout_sec=0.1)
+                    time.sleep(0.1)
                     elapsed = (self.node.get_clock().now() - start).nanoseconds / 1e9
                     if elapsed > timeout_sec:
                         self.node.get_logger().warn("Timeout waiting for /clear_octomap to complete")
@@ -207,7 +208,12 @@ class SceneManager:
         else:
             bg_mask = np.ones_like(z_m, dtype=bool)
         pts_bg = self._build_points(z_m, bg_mask)
-        self.node.get_logger().info(f"Background points generated: {pts_bg.shape[0]}")
+        if pts_bg.shape[0] > 0:
+            self.node.get_logger().info(
+                f"Background points generated: {pts_bg.shape[0]}, "
+                f"z range: [{pts_bg[:,2].min():.4f}, {pts_bg[:,2].max():.4f}]")
+        else:
+            self.node.get_logger().info(f"Background points generated: 0")
 
         # 6. 估计背景z
         base_z = 0.015
@@ -221,8 +227,8 @@ class SceneManager:
         else:
             table_filter_margin = None
 
-        # 7. 先为每个启用的实例生成凸包
-        k = 5 if self.stride <= 2 else 3
+        # 7. 先为每个启用的实例生成凸包（适当腐蚀避免邻居重叠）
+        k = 7 if self.stride <= 2 else 5
         kernel = np.ones((k, k), np.uint8)
 
         meshes: list[tuple[str, Mesh]] = []
@@ -282,23 +288,20 @@ class SceneManager:
                     return
 
                 self.node.get_logger().info(f"Waiting for subscribers... ({elapsed:.1f}s)")
-                rclpy.spin_once(self.node, timeout_sec=0.5)
+                time.sleep(0.5)
 
             # 发布点云（增加次数和间隔，确保 octomap 充分消费）
             self.node.get_logger().info(f"Publishing background cloud: {pts_bg.shape[0]} points to {self.topic} in frame {self.frame_id}")
+            self.octomap_received = False
             for i in range(5):
                 self._publish_pointcloud(pts_bg)
-                rclpy.spin_once(self.node, timeout_sec=0.0)
-                self.node.get_clock().sleep_for(rclpy.duration.Duration(seconds=0.1))
-            self.node.get_logger().info(f"✓ Finished publishing background cloud (20 times over 2s)")
-
-            # 等待 octomap 回调被触发
-            self.octomap_received = False
+                time.sleep(0.1)
+            self.node.get_logger().info(f"✓ Finished publishing background cloud (5 times over 0.5s)")
             self.node.get_logger().info("Waiting for octomap response...")
             wait_start = self.node.get_clock().now()
             wait_timeout = 15.0
             while not self.octomap_received:
-                rclpy.spin_once(self.node, timeout_sec=0.1)
+                time.sleep(0.1)
                 elapsed = (self.node.get_clock().now() - wait_start).nanoseconds / 1e9
                 if elapsed > wait_timeout:
                     self.node.get_logger().error(f"Timeout waiting for octomap response after {wait_timeout}s")
@@ -461,7 +464,7 @@ class SceneManager:
     def _publish_pointcloud(self, pts: np.ndarray):
         """发布点云消息"""
         header = Header()
-        header.stamp = self.node.get_clock().now().to_msg()
+        header.stamp = rclpy.time.Time(seconds=0).to_msg()
         header.frame_id = self.frame_id
         msg = point_cloud2.create_cloud_xyz32(header, pts.tolist())
         self.pub.publish(msg)

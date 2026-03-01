@@ -34,13 +34,21 @@ from scipy.spatial.transform import Rotation as R
 from pointcloud_to_moveit_convexhull import SceneManager
 
 _MOVEIT_ERROR_NAMES = {
-    1: "SUCCESS", -1: "FAILURE", -2: "PLANNING_FAILED",
-    -3: "INVALID_MOTION_PLAN", -4: "MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE",
-    -5: "CONTROL_FAILED", -6: "UNABLE_TO_AQUIRE_SENSOR_DATA",
-    -7: "TIMED_OUT", -10: "PREEMPTED", -11: "START_STATE_IN_COLLISION",
-    -12: "START_STATE_VIOLATES_PATH_CONSTRAINTS", -13: "GOAL_IN_COLLISION",
-    -14: "GOAL_VIOLATES_PATH_CONSTRAINTS", -15: "GOAL_CONSTRAINTS_VIOLATED",
-    -16: "INVALID_GROUP_NAME", -21: "NO_IK_SOLUTION"
+    1: "SUCCESS", 0: "UNDEFINED", 99999: "FAILURE",
+    -1: "PLANNING_FAILED", -2: "INVALID_MOTION_PLAN",
+    -3: "MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE",
+    -4: "CONTROL_FAILED", -5: "UNABLE_TO_AQUIRE_SENSOR_DATA",
+    -6: "TIMED_OUT", -7: "PREEMPTED",
+    -10: "START_STATE_IN_COLLISION", -11: "START_STATE_VIOLATES_PATH_CONSTRAINTS",
+    -12: "GOAL_IN_COLLISION", -13: "GOAL_VIOLATES_PATH_CONSTRAINTS",
+    -14: "GOAL_CONSTRAINTS_VIOLATED", -15: "INVALID_GROUP_NAME",
+    -16: "INVALID_GOAL_CONSTRAINTS", -17: "INVALID_ROBOT_STATE",
+    -18: "INVALID_LINK_NAME", -19: "INVALID_OBJECT_NAME",
+    -21: "FRAME_TRANSFORM_FAILURE", -22: "COLLISION_CHECKING_UNAVAILABLE",
+    -23: "ROBOT_STATE_STALE", -24: "SENSOR_INFO_STALE",
+    -25: "COMMUNICATION_FAILURE", -26: "START_STATE_INVALID",
+    -27: "GOAL_STATE_INVALID", -28: "UNRECOGNIZED_GOAL_TYPE",
+    -29: "CRASH", -30: "ABORT",
 }
 
 
@@ -82,7 +90,9 @@ class GraspExecutor(Node):
         self.current_joint_state = None
         self.attached_objects = {}
         self.scene_manager = None
+        self.get_logger().info("[Init] Initializing scene manager...")
         self.init_scene_manager()
+        self.get_logger().info("[Init] Scene manager done, connecting to action servers...")
 
         self.move_action_client = ActionClient(self, MoveGroup, "move_action")
         self.execute_client = ActionClient(self, ExecuteTrajectory, "execute_trajectory")
@@ -91,14 +101,31 @@ class GraspExecutor(Node):
         self.apply_scene_client = self.create_client(ApplyPlanningScene, "/apply_planning_scene")
         self.scene_pub = self.create_publisher(PlanningScene, "/planning_scene", 10)
 
+        self.get_logger().info("[Init] Waiting for MoveGroup action server...")
         if not self.move_action_client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError("MoveGroup action server not responding")
-        if self.execution_mode and not self.execute_client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().warn("ExecuteTrajectory action server not responding")
-        if self.execution_mode and not self.gripper_move_client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().warn("Gripper action server not responding")
+        self.get_logger().info("[Init] MoveGroup ready")
+
+        if self.execution_mode:
+            self.get_logger().info("[Init] Waiting for ExecuteTrajectory action server...")
+            if not self.execute_client.wait_for_server(timeout_sec=10.0):
+                self.get_logger().warn("ExecuteTrajectory action server not responding")
+            else:
+                self.get_logger().info("[Init] ExecuteTrajectory ready")
+
+            self.get_logger().info("[Init] Waiting for Gripper action server...")
+            if not self.gripper_move_client.wait_for_server(timeout_sec=10.0):
+                self.get_logger().warn("Gripper action server not responding")
+            else:
+                self.get_logger().info("[Init] Gripper ready")
+
+        self.get_logger().info("[Init] Waiting for CartesianPath service...")
         if not self.cartesian_path_client.wait_for_service(timeout_sec=10.0):
             self.get_logger().warn("Cartesian path service not available")
+        else:
+            self.get_logger().info("[Init] CartesianPath ready")
+
+        self.get_logger().info("[Init] All services connected")
 
     def _spin_wait(self, timeout_sec=0.1):
         """等待回调处理（CLI 用 spin_once，HTTP 服务 fallback 到 sleep）"""
@@ -341,7 +368,21 @@ class GraspExecutor(Node):
         ps = PlanningScene()
         ps.is_diff = True
         ps.world.collision_objects.append(co)
-        self.scene_pub.publish(ps)
+
+        if self.apply_scene_client.wait_for_service(timeout_sec=2.0):
+            req = ApplyPlanningScene.Request()
+            req.scene = ps
+            future = self.apply_scene_client.call_async(req)
+            deadline = time.monotonic() + 5.0
+            while not future.done():
+                if time.monotonic() > deadline:
+                    self.get_logger().warn(
+                        f"Timeout removing '{object_id}', falling back to topic")
+                    self.scene_pub.publish(ps)
+                    break
+                self._spin_wait(0.05)
+        else:
+            self.scene_pub.publish(ps)
         return True
 
     def clear_octomap(self):
@@ -565,12 +606,14 @@ class GraspExecutor(Node):
         return False
 
     def attach_object_mesh(self, instance_id: str) -> bool:
-        """将物体凸包附着到抓夹"""
+        """将物体凸包附着到夹爪"""
         if instance_id not in self.scene_manager.processed_meshes:
             self.get_logger().error(f"No mesh for '{instance_id}'")
             return False
 
         mesh = self.scene_manager.processed_meshes[instance_id]
+        self.get_logger().info(
+            f"Attaching '{instance_id}' mesh ({len(mesh.vertices)} vertices)")
 
         try:
             co = CollisionObject()
@@ -592,7 +635,36 @@ class GraspExecutor(Node):
             ps.is_diff = True
             ps.robot_state.is_diff = True
             ps.robot_state.attached_collision_objects.append(aco)
-            self.scene_pub.publish(ps)
+
+            # 使用 service 调用确保 MoveIt 确实应用了 attach
+            attached = False
+            if self.apply_scene_client.wait_for_service(timeout_sec=2.0):
+                req = ApplyPlanningScene.Request()
+                req.scene = ps
+                future = self.apply_scene_client.call_async(req)
+                deadline = time.monotonic() + 5.0
+                while not future.done():
+                    if time.monotonic() > deadline:
+                        self.get_logger().warn(
+                            f"Timeout attaching '{instance_id}', falling back to topic")
+                        self.scene_pub.publish(ps)
+                        attached = True
+                        break
+                    self._spin_wait(0.05)
+                else:
+                    resp = future.result()
+                    attached = resp.success if resp else False
+                    if not attached:
+                        self.get_logger().warn(
+                            f"ApplyPlanningScene returned failure for attach, "
+                            f"falling back to topic")
+                        self.scene_pub.publish(ps)
+                        attached = True
+            else:
+                self.get_logger().warn(
+                    "/apply_planning_scene not available, using topic")
+                self.scene_pub.publish(ps)
+                attached = True
 
             self.attached_objects[instance_id] = aco
             self.get_logger().info(f"Attached '{instance_id}' to '{self.gripper_link}'")
@@ -643,7 +715,7 @@ class GraspExecutor(Node):
         rpy: Sequence[float],
         drive_joint_rad: float,
         pos_tol: float = 0.01,
-        ori_tol: float = 0.01,
+        ori_tol: float = 0.1,
         allowed_time: float = 10.0,
         planner_id: Optional[str] = None,
         start_joint_state: Optional[List[float]] = None,
@@ -671,6 +743,9 @@ class GraspExecutor(Node):
             req.start_state.is_diff = False
             req.start_state.joint_state.name = self.arm_joint_names + js.name
             req.start_state.joint_state.position = [float(j) for j in start_joint_state] + list(js.position)
+            # 将已 attach 的物品写入 start_state，否则规划器不知道附着物
+            for aco in self.attached_objects.values():
+                req.start_state.attached_collision_objects.append(aco)
         else:
             req.start_state.is_diff = True
             req.start_state.joint_state = js
@@ -740,6 +815,8 @@ class GraspExecutor(Node):
             req.start_state.is_diff = False
             req.start_state.joint_state.name = self.arm_joint_names + js.name
             req.start_state.joint_state.position = [float(j) for j in start_joint_state] + list(js.position)
+            for aco in self.attached_objects.values():
+                req.start_state.attached_collision_objects.append(aco)
         else:
             req.start_state.is_diff = True
             req.start_state.joint_state = js
@@ -831,6 +908,8 @@ class GraspExecutor(Node):
         req.start_state = RobotState()
         req.start_state.joint_state.name = self.arm_joint_names + ["drive_joint"]
         req.start_state.joint_state.position = list(start_joint_state) + [float(drive_joint_rad)]
+        for aco in self.attached_objects.values():
+            req.start_state.attached_collision_objects.append(aco)
 
         try:
             future = self.cartesian_path_client.call_async(req)
@@ -855,6 +934,42 @@ class GraspExecutor(Node):
             self.get_logger().error(f"Cartesian path planning error: {e}")
             return None
 
+    def _restore_neighbors(self, neighbor_ids: List[str]):
+        """恢复之前因冲突而临时移除的邻居凸包"""
+        if not neighbor_ids or self.scene_manager is None:
+            return
+        meshes_to_restore = []
+        for nid in neighbor_ids:
+            if nid in self.scene_manager.processed_meshes:
+                meshes_to_restore.append((nid, self.scene_manager.processed_meshes[nid]))
+        if meshes_to_restore:
+            self.scene_manager._apply_collision_meshes(meshes_to_restore)
+            self.get_logger().info(f"Restored {len(meshes_to_restore)} neighbor hulls: {neighbor_ids}")
+            time.sleep(0.2)
+
+    def _find_conflicting_neighbors(
+        self,
+        point: Sequence[float],
+        exclude_id: str,
+        margin: float = 0.02
+    ) -> List[str]:
+        """找出凸包与给定3D点冲突的邻居物体ID。
+        用简单的AABB包围盒+margin快速检测，不需要精确的mesh内点测试。
+        """
+        if self.scene_manager is None:
+            return []
+        conflicting = []
+        pt = np.array(point, dtype=np.float64)
+        for inst_id, mesh in self.scene_manager.processed_meshes.items():
+            if inst_id == exclude_id:
+                continue
+            verts = np.array([[v.x, v.y, v.z] for v in mesh.vertices])
+            bbox_min = verts.min(axis=0) - margin
+            bbox_max = verts.max(axis=0) + margin
+            if np.all(pt >= bbox_min) and np.all(pt <= bbox_max):
+                conflicting.append(inst_id)
+        return conflicting
+
     def plan_candidate(
         self,
         aff: Dict[str, Any],
@@ -862,7 +977,9 @@ class GraspExecutor(Node):
         planner_id: Optional[str] = None,
         start_joint_state: Optional[List[float]] = None,
         pos_tol: float = 0.01,
-        ori_tol: float = 0.01
+        ori_tol: float = 0.1,
+        allowed_time: float = 15.0,
+        num_planning_attempts: int = 3
     ) -> Optional[Dict[str, Any]]:
         surface_center = aff["center"]
         gripper_width = float(aff["boundingbox"]["width"]) + float(aff.get("extra_open", 0.0))
@@ -872,8 +989,11 @@ class GraspExecutor(Node):
         if "grasp_pose_rpy" in aff:
             adjusted_grasp_pose = aff["grasp_pose_rpy"]
         elif "angle" in aff:
-            roll, pitch, _ = grasp_pose
-            yaw = float(aff["angle"])
+            roll, pitch, start_yaw = grasp_pose
+            angle = float(aff["angle"])
+            if angle > 90:
+                angle -= 180
+            yaw = start_yaw - np.radians(angle)
             adjusted_grasp_pose = [roll, pitch, yaw]
         else:
             adjusted_grasp_pose = grasp_pose
@@ -910,11 +1030,12 @@ class GraspExecutor(Node):
             xyz=pregrasp_center,
             rpy=pregrasp_pose,
             drive_joint_rad=drive_joint_rad,
-            allowed_time=300.0,
+            allowed_time=allowed_time,
             planner_id=planner_id,
             start_joint_state=current_state,
             pos_tol=pos_tol,
-            ori_tol=ori_tol
+            ori_tol=ori_tol,
+            num_planning_attempts=num_planning_attempts
         )
 
         if not self.move_action_client.server_is_ready():
@@ -922,96 +1043,142 @@ class GraspExecutor(Node):
             return None
 
         label = f"[Candidate {aff.get('id', '?')}]"
+        instance_id = aff.get("instance_id", "")
+        removed_neighbors = []  # 记录因冲突而临时移除的邻居
+
+        # ── pregrasp 规划（GOAL_IN_COLLISION 时自动移除冲突邻居重试）──
         result = self._send_action_goal(
             self.move_action_client, pregrasp_goal,
-            send_timeout=15.0, result_timeout=310.0,
+            send_timeout=15.0, result_timeout=allowed_time + 30.0,
             label=label, log_interval=10.0)
 
+        if result is not None and result.result.error_code.val in (
+            MoveItErrorCodes.GOAL_IN_COLLISION,
+            MoveItErrorCodes.START_STATE_IN_COLLISION
+        ):
+            # 检测哪些邻居凸包与预抓取点/抓取点冲突
+            conflicts = self._find_conflicting_neighbors(
+                pregrasp_center, exclude_id=instance_id)
+            conflicts += [c for c in self._find_conflicting_neighbors(
+                center, exclude_id=instance_id) if c not in conflicts]
+
+            if conflicts:
+                self.get_logger().info(
+                    f"{label} Goal in collision, removing {len(conflicts)} "
+                    f"conflicting neighbors: {conflicts}")
+                for cid in conflicts:
+                    self.remove_object_from_scene(cid)
+                    removed_neighbors.append(cid)
+                time.sleep(0.3)
+
+                # 重试规划
+                result = self._send_action_goal(
+                    self.move_action_client, pregrasp_goal,
+                    send_timeout=15.0, result_timeout=allowed_time + 30.0,
+                    label=f"{label} retry", log_interval=10.0)
+
         if result is None:
+            self._restore_neighbors(removed_neighbors)
             return None
 
         error_code = result.result.error_code.val
         if error_code != MoveItErrorCodes.SUCCESS:
             name = _MOVEIT_ERROR_NAMES.get(error_code, f"UNKNOWN({error_code})")
             self.get_logger().warn(f"Planning failed for candidate {aff.get('id', '?')}: {name}")
+            self._restore_neighbors(removed_neighbors)
             return None
 
         result_dict["pregrasp_trajectory"] = result.result.planned_trajectory
+        result_dict["removed_neighbors"] = removed_neighbors
         current_state = self.extract_final_joint_state(result.result.planned_trajectory)
         if current_state is None:
+            self._restore_neighbors(removed_neighbors)
             return None
 
-        # 预抓取→抓取：优先笛卡尔规划，失败则 fallback 到关节空间
-        grasp_pose_msg = Pose()
-        grasp_pose_msg.position = Point(x=float(center[0]), y=float(center[1]), z=float(center[2]))
-        qx, qy, qz, qw = R.from_euler("xyz", adjusted_grasp_pose, degrees=False).as_quat()
-        grasp_pose_msg.orientation = Quaternion(x=float(qx), y=float(qy), z=float(qz), w=float(qw))
-        cartesian_result = self.plan_cartesian_path(
-            waypoints=[grasp_pose_msg], start_joint_state=current_state,
-            max_step=0.005, avoid_collisions=True)
+        # ── grasp 规划 ──
+        grasp_goal = self.build_goal(
+            xyz=center, rpy=adjusted_grasp_pose,
+            drive_joint_rad=drive_joint_rad,
+            allowed_time=allowed_time, planner_id=planner_id,
+            start_joint_state=current_state,
+            pos_tol=pos_tol, ori_tol=ori_tol,
+            num_planning_attempts=num_planning_attempts
+        )
+        grasp_result = self._send_action_goal(
+            self.move_action_client, grasp_goal,
+            send_timeout=15.0, result_timeout=allowed_time + 30.0,
+            label=f"[Candidate {aff.get('id', '?')} grasp]")
+        if grasp_result is None or grasp_result.result.error_code.val != MoveItErrorCodes.SUCCESS:
+            self._restore_neighbors(removed_neighbors)
+            return None
 
-        if cartesian_result is None:
-            grasp_goal = self.build_goal(
-                xyz=center, rpy=adjusted_grasp_pose,
-                drive_joint_rad=drive_joint_rad,
-                allowed_time=300.0, planner_id=planner_id,
-                start_joint_state=current_state,
-                pos_tol=pos_tol, ori_tol=ori_tol
-            )
-            grasp_result = self._send_action_goal(
-                self.move_action_client, grasp_goal,
-                send_timeout=15.0, result_timeout=310.0,
-                label=f"[Candidate {aff.get('id', '?')} grasp]")
-            if grasp_result is None or grasp_result.result.error_code.val != MoveItErrorCodes.SUCCESS:
-                return None
-
-            result_dict["grasp_trajectory"] = grasp_result.result.planned_trajectory
-            result_dict["final_joint_state"] = self.extract_final_joint_state(grasp_result.result.planned_trajectory)
-            if result_dict["final_joint_state"] is None:
-                return None
-        else:
-            result_dict["grasp_trajectory"] = cartesian_result[0]
-            result_dict["final_joint_state"] = cartesian_result[1]
+        result_dict["grasp_trajectory"] = grasp_result.result.planned_trajectory
+        result_dict["final_joint_state"] = self.extract_final_joint_state(grasp_result.result.planned_trajectory)
+        if result_dict["final_joint_state"] is None:
+            self._restore_neighbors(removed_neighbors)
+            return None
 
         return result_dict
+
+    def _manage_scene_for_candidate(self, iid: str, cur_removed: Optional[str]) -> str:
+        """移除当前候选物体、恢复上一个，返回新的 cur_removed"""
+        if iid != cur_removed:
+            if cur_removed and self.scene_manager and cur_removed in self.scene_manager.processed_meshes:
+                self.scene_manager._apply_collision_meshes(
+                    [(cur_removed, self.scene_manager.processed_meshes[cur_removed])])
+            if iid:
+                self.remove_object_from_scene(iid)
+                time.sleep(0.2)
+        return iid
+
+    def _restore_last_removed(self, cur_removed: Optional[str]):
+        if cur_removed and self.scene_manager and cur_removed in self.scene_manager.processed_meshes:
+            self.scene_manager._apply_collision_meshes(
+                [(cur_removed, self.scene_manager.processed_meshes[cur_removed])])
 
     def plan_rank_all_candidates(
         self,
         grasp_candidates: List[Dict[str, Any]],
         grasp_pose: Sequence[float],
-        planner_id: str = "RRTstart",
+        planner_id: str = "ABITstar",
         start_joint_state: Optional[List[float]] = None,
         start_xyz: Optional[Sequence[float]] = None,
         pos_tol: float = 0.01,
-        ori_tol: float = 0.01
+        ori_tol: float = 0.1,
+        fast_filter_time: float = 5.0,
+        refine_time: float = 15.0,
+        top_n: int = 1
     ) -> List[Dict[str, Any]]:
-        results = []
+        """两阶段规划：
+        Phase 1 - RRTConnect 快速筛选全部候选（每个 ~1-3s）
+        Phase 2 - ABITstar 只对 cost 最小的候选做轨迹优化（~15s）
+        """
         t0 = time.perf_counter()
-        cur_removed = None  # 当前被移除的 instance_id
+
+        # ── Phase 1: 快速可达性筛选 ──
+        self.get_logger().info(
+            f"[Phase1] Filtering {len(grasp_candidates)} candidates with RRTConnect ({fast_filter_time}s each)")
+        feasible = []
+        cur_removed = None
 
         for aff in grasp_candidates:
             iid = aff.get("instance_id", "")
-
-            # 只移除当前候选对应的物体，其他物体保留碰撞检测
-            if iid != cur_removed:
-                # 恢复上一个
-                if cur_removed and self.scene_manager and cur_removed in self.scene_manager.processed_meshes:
-                    self.scene_manager._apply_collision_meshes(
-                        [(cur_removed, self.scene_manager.processed_meshes[cur_removed])])
-                # 移除当前
-                if iid:
-                    self.remove_object_from_scene(iid)
-                    time.sleep(0.2)
-                cur_removed = iid
+            cur_removed = self._manage_scene_for_candidate(iid, cur_removed)
 
             t_cand = time.perf_counter()
-            r = self.plan_candidate(aff, grasp_pose=grasp_pose,
-                planner_id=planner_id, start_joint_state=start_joint_state,
-                pos_tol=pos_tol, ori_tol=ori_tol)
+            r = self.plan_candidate(
+                aff, grasp_pose=grasp_pose,
+                planner_id="RRTConnect",
+                start_joint_state=start_joint_state,
+                pos_tol=pos_tol, ori_tol=ori_tol,
+                allowed_time=fast_filter_time,
+                num_planning_attempts=1
+            )
             if r is not None:
+                # 恢复因冲突而临时移除的邻居凸包
+                self._restore_neighbors(r.get("removed_neighbors", []))
                 r['candidate_planning_time'] = time.perf_counter() - t_cand
                 main_traj = r["pregrasp_trajectory"]
-                # 笛卡尔直线距离，用于归一化路径长度项
                 if start_xyz is not None and "pregrasp_center" in r:
                     straight = float(np.linalg.norm(
                         np.array(r["pregrasp_center"]) - np.array(start_xyz)))
@@ -1020,21 +1187,80 @@ class GraspExecutor(Node):
                 cost_info = self.trajectory_cost(main_traj, cartesian_dist=straight)
                 r['cost'] = cost_info['cost']
                 r['cost_metrics'] = cost_info['metrics']
+                r['_aff'] = aff  # 保留原始候选引用
+                feasible.append(r)
 
-                results.append(r)
+        self._restore_last_removed(cur_removed)
 
-        # 恢复最后一个被移除的物体
-        if cur_removed and self.scene_manager and cur_removed in self.scene_manager.processed_meshes:
-            self.scene_manager._apply_collision_meshes(
-                [(cur_removed, self.scene_manager.processed_meshes[cur_removed])])
+        phase1_time = time.perf_counter() - t0
+        self.get_logger().info(
+            f"[Phase1] {len(feasible)}/{len(grasp_candidates)} feasible in {phase1_time:.2f}s")
 
-        planning_time = time.perf_counter() - t0
-        self.get_logger().info(f"[Approaching] Planning complete: {len(results)}/{len(grasp_candidates)} succeeded "
-                               f"in {planning_time:.2f}s")
-
-        if not results:
+        if not feasible:
             self.get_logger().error("All candidates failed planning")
             return []
+
+        # 按初步 cost 排序，取 top-N 进入 Phase 2
+        feasible.sort(key=lambda r: r['cost'])
+        to_refine = feasible[:top_n]
+
+        # ── Phase 2: 渐近最优规划器精化 ──
+        self.get_logger().info(
+            f"[Phase2] Refining top-{len(to_refine)} with {planner_id} ({refine_time}s each)")
+        results = []
+        cur_removed = None
+
+        for fast_r in to_refine:
+            aff = fast_r['_aff']
+            iid = aff.get("instance_id", "")
+            cur_removed = self._manage_scene_for_candidate(iid, cur_removed)
+
+            t_cand = time.perf_counter()
+            r = self.plan_candidate(
+                aff, grasp_pose=grasp_pose,
+                planner_id=planner_id,
+                start_joint_state=start_joint_state,
+                pos_tol=pos_tol, ori_tol=ori_tol,
+                allowed_time=refine_time,
+                num_planning_attempts=3
+            )
+            if r is not None:
+                self._restore_neighbors(r.get("removed_neighbors", []))
+                r['candidate_planning_time'] = time.perf_counter() - t_cand
+                main_traj = r["pregrasp_trajectory"]
+                if start_xyz is not None and "pregrasp_center" in r:
+                    straight = float(np.linalg.norm(
+                        np.array(r["pregrasp_center"]) - np.array(start_xyz)))
+                else:
+                    straight = 0.0
+                cost_info = self.trajectory_cost(main_traj, cartesian_dist=straight)
+                r['cost'] = cost_info['cost']
+                r['cost_metrics'] = cost_info['metrics']
+                results.append(r)
+            else:
+                # ABITstar 失败，保留 Phase 1 的 RRTConnect 结果
+                self.get_logger().info(
+                    f"[Phase2] {planner_id} failed for candidate {aff.get('id', '?')}, keeping RRTConnect result")
+                del fast_r['_aff']
+                results.append(fast_r)
+
+        self._restore_last_removed(cur_removed)
+
+        # 将 Phase 1 中未进入 Phase 2 的可达候选也追加（保留 RRTConnect 解）
+        refined_ids = {r.get('id') for r in results}
+        for r in feasible[top_n:]:
+            if r.get('id') not in refined_ids:
+                del r['_aff']
+                results.append(r)
+
+        # 清理临时字段
+        for r in results:
+            r.pop('_aff', None)
+
+        planning_time = time.perf_counter() - t0
+        self.get_logger().info(
+            f"[Approaching] Planning complete: {len(results)}/{len(grasp_candidates)} succeeded "
+            f"in {planning_time:.2f}s (phase1={phase1_time:.1f}s)")
 
         results.sort(key=lambda r: r['cost'])
         return results
@@ -1069,7 +1295,7 @@ class GraspExecutor(Node):
         home_joints: Optional[List[float]] = None,
         end_pos: Optional[List[float]] = None,
         pos_tol: float = 0.01,
-        ori_tol: float = 0.01
+        ori_tol: float = 0.1
     ) -> Dict[str, Any]:
         instance_id = best_candidate["instance_id"]
         grasp_z = best_candidate["center"][2]
@@ -1126,12 +1352,16 @@ class GraspExecutor(Node):
 
             # 附着物体到夹爪（影响后续碰撞检测）
             self.get_logger().info(f"[Scene] Attaching object '{instance_id}' to gripper for carrying phase")
-            if not self.attach_object_mesh(instance_id):
-                self.get_logger().error(f"[Attach] Failed to attach '{instance_id}', aborting sequence")
-                return result
-            object_attached = True
+            attach_ok = self.attach_object_mesh(instance_id)
+            if attach_ok:
+                object_attached = True
+                self.get_logger().info(f"[Attach] '{instance_id}' attached, "
+                                       f"attached_objects={list(self.attached_objects.keys())}")
+            else:
+                self.get_logger().warn(f"[Attach] Failed to attach '{instance_id}', "
+                                       f"continuing without attached object")
 
-            # retreat: 回退到预抓取点
+            # retreat: 笛卡尔直线回退到预抓取点
             pregrasp_center = best_candidate["pregrasp_center"]
             actual_rpy = best_candidate.get("grasp_pose_rpy") or (
                 [grasp_pose_base[0], grasp_pose_base[1], best_candidate["angle"]]
@@ -1145,13 +1375,35 @@ class GraspExecutor(Node):
             retreat_result = self.plan_cartesian_path(
                 waypoints=[retreat_pose], start_joint_state=current_joint_state,
                 max_step=0.005, avoid_collisions=True)
-            if retreat_result is None:
-                self.get_logger().error("[Retreat] Planning failed")
-                return result
-            retreat_traj, current_joint_state = retreat_result
+            if retreat_result is not None:
+                retreat_traj, current_joint_state = retreat_result
+            else:
+                self.get_logger().warn("[Retreat] Cartesian failed, falling back to sampling planner")
+                retreat_traj = None
+                for planner, t, attempts in [("RRTConnect", 10.0, 5), ("RRTConnect", 15.0, 5)]:
+                    self.get_logger().info(f"[Retreat] Trying {planner} t={t}s")
+                    goal = self.build_goal(
+                        xyz=pregrasp_center, rpy=actual_rpy,
+                        drive_joint_rad=close_rad,
+                        start_joint_state=current_joint_state,
+                        planner_id=planner, allowed_time=t,
+                        num_planning_attempts=attempts,
+                        pos_tol=0.01, ori_tol=0.1)
+                    result_msg = self._send_action_goal(
+                        self.move_action_client, goal,
+                        send_timeout=15.0, result_timeout=t + 15.0, label="[Retreat]")
+                    if result_msg is not None and result_msg.result.error_code.val == MoveItErrorCodes.SUCCESS:
+                        retreat_traj = result_msg.result.planned_trajectory
+                        current_joint_state = self.extract_final_joint_state(retreat_traj)
+                        self.get_logger().info(f"[Retreat] {planner} succeeded")
+                        break
+                    err = result_msg.result.error_code.val if result_msg else "no response"
+                    self.get_logger().warn(f"[Retreat] {planner} failed: {_MOVEIT_ERROR_NAMES.get(err, err)}")
+                if retreat_traj is None:
+                    self.get_logger().error("[Retreat] All planners failed")
+                    return result
             result["trajectories"]["retreat"] = retreat_traj
 
-            # 执行退回到预抓取点
             if not self.execute_trajectory(retreat_traj):
                 self.get_logger().error("[Retreat] Execution failed")
                 return result
@@ -1159,44 +1411,46 @@ class GraspExecutor(Node):
             if self.execution_mode:
                 time.sleep(0.3)
 
-            # carry: 搬运到放置点（笛卡尔优先，碰撞时退化到采样规划）
-            place_z = grasp_z + basket["size"][2] + place_clearance
-            carry_pose = Pose()
-            carry_pose.position = Point(
-                x=float(basket["center"][0]),
-                y=float(basket["center"][1]),
-                z=float(place_z))
-            carry_quat = R.from_euler("xyz", [-np.pi, 0.0, 0.0], degrees=False).as_quat()
-            carry_pose.orientation = Quaternion(
-                x=float(carry_quat[0]), y=float(carry_quat[1]),
-                z=float(carry_quat[2]), w=float(carry_quat[3]))
+            # carry: 搬运到篮子上方（篮子顶沿 + clearance）
+            basket_rim_z = basket["center"][2] + basket["size"][2] / 2
+            place_z = max(basket_rim_z + place_clearance, 0.25)
+            carry_xyz = [float(basket["center"][0]), float(basket["center"][1]), float(place_z)]
+            carry_rpy = (-np.pi, 0.0, 0.0)
 
-            carry_result = self.plan_cartesian_path(
-                waypoints=[carry_pose], start_joint_state=current_joint_state,
-                drive_joint_rad=close_rad, max_step=0.01, avoid_collisions=True)
-            if carry_result is None:
-                self.get_logger().info("[Carrying] Cartesian failed, falling back to RRTstart")
+            self.get_logger().info(f"[Carrying] target={carry_xyz}")
+
+            carry_result = None
+            for planner, t, attempts, p_tol, o_tol in [
+                ("RRTConnect", 10.0, 5, 0.01, 0.1),
+                ("RRTConnect", 15.0, 5, 0.05, 0.3),
+            ]:
+                self.get_logger().info(f"[Carrying] {planner} t={t}s pos={p_tol} ori={o_tol}")
                 carry_goal = self.build_goal(
-                    xyz=[basket["center"][0], basket["center"][1], place_z],
-                    rpy=(-np.pi, 0.0, 0.0), drive_joint_rad=close_rad,
+                    xyz=carry_xyz, rpy=carry_rpy, drive_joint_rad=close_rad,
                     start_joint_state=current_joint_state,
-                    planner_id="RRTstart", allowed_time=30.0,
-                    num_planning_attempts=5, pos_tol=pos_tol, ori_tol=ori_tol)
+                    planner_id=planner, allowed_time=t,
+                    num_planning_attempts=attempts,
+                    pos_tol=p_tol, ori_tol=o_tol)
                 result_msg = self._send_action_goal(
                     self.move_action_client, carry_goal,
-                    send_timeout=15.0, result_timeout=40.0, label="[Carrying]")
-                if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
-                    self.get_logger().error("[Carrying] Planning failed")
-                    return result
-                carry_result = (result_msg.result.planned_trajectory,
-                                self.extract_final_joint_state(result_msg.result.planned_trajectory))
+                    send_timeout=15.0, result_timeout=t + 15.0, label="[Carrying]")
+                if result_msg is not None and result_msg.result.error_code.val == MoveItErrorCodes.SUCCESS:
+                    carry_result = (result_msg.result.planned_trajectory,
+                                    self.extract_final_joint_state(result_msg.result.planned_trajectory))
+                    self.get_logger().info(f"[Carrying] {planner} succeeded")
+                    break
+                err = result_msg.result.error_code.val if result_msg else "no response"
+                self.get_logger().warn(f"[Carrying] {planner} failed: {_MOVEIT_ERROR_NAMES.get(err, err)}")
+
+            if carry_result is None:
+                self.get_logger().error("[Carrying] All planners failed")
+                return result
             carry_traj, current_joint_state = carry_result
             if current_joint_state is None:
                 self.get_logger().error("[Carrying] Failed to extract final state")
                 return result
             result["trajectories"]["carrying"] = carry_traj
 
-            # 执行搬运轨迹
             if not self.execute_trajectory(carry_traj):
                 self.get_logger().error("[Carrying] Execution failed")
                 return result
@@ -1214,50 +1468,36 @@ class GraspExecutor(Node):
             object_attached = False
             time.sleep(0.3)
 
-            # return: 笛卡尔优先 → 采样退化
-            if end_pos:
-                return_pose = Pose()
-                return_pose.position = Point(
-                    x=float(end_pos[0]), y=float(end_pos[1]), z=float(end_pos[2]))
-                ret_quat = R.from_euler("xyz", list(end_pos[3:]), degrees=False).as_quat()
-                return_pose.orientation = Quaternion(
-                    x=float(ret_quat[0]), y=float(ret_quat[1]),
-                    z=float(ret_quat[2]), w=float(ret_quat[3]))
+            # return: 严格按关节角回到 home
+            build_fn = lambda plnr, t, att, pt, ot: self.build_joint_goal(
+                joint_positions=home_joints or [0.0] * 7,
+                drive_joint_rad=self.gripper_joint_max,
+                start_joint_state=current_joint_state,
+                planner_id=plnr, allowed_time=t,
+                num_planning_attempts=att)
 
-                return_result = self.plan_cartesian_path(
-                    waypoints=[return_pose], start_joint_state=current_joint_state,
-                    drive_joint_rad=self.gripper_joint_max, max_step=0.01, avoid_collisions=True)
-                if return_result is None:
-                    self.get_logger().info("[Returning] Cartesian failed, falling back to RRTstart")
-                    return_goal = self.build_goal(
-                        xyz=end_pos[:3], rpy=end_pos[3:],
-                        drive_joint_rad=self.gripper_joint_max,
-                        start_joint_state=current_joint_state,
-                        planner_id="RRTstart", allowed_time=30.0,
-                        num_planning_attempts=5, pos_tol=pos_tol, ori_tol=ori_tol)
-                    result_msg = self._send_action_goal(
-                        self.move_action_client, return_goal,
-                        send_timeout=15.0, result_timeout=40.0, label="[Returning]")
-                    if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
-                        self.get_logger().error("[Returning] Planning failed")
-                        return result
-                    result["trajectories"]["returning"] = result_msg.result.planned_trajectory
-                else:
-                    result["trajectories"]["returning"] = return_result[0]
-            else:
-                return_goal = self.build_joint_goal(
-                    joint_positions=home_joints or [0.0] * 7,
-                    drive_joint_rad=self.gripper_joint_max,
-                    allowed_time=30.0, planner_id="RRTstart",
-                    start_joint_state=current_joint_state,
-                    num_planning_attempts=5)
+            return_traj = None
+            for planner, t, attempts, tol_scale in [
+                ("RRTConnect", 10.0, 5, 1.0),
+                ("RRTConnect", 15.0, 5, 1.5),
+            ]:
+                self.get_logger().info(f"[Returning] Trying {planner} (time={t}s)")
+                return_goal = build_fn(planner, t, attempts,
+                                       pos_tol * tol_scale, ori_tol * tol_scale)
                 result_msg = self._send_action_goal(
                     self.move_action_client, return_goal,
-                    send_timeout=15.0, result_timeout=40.0, label="[Returning]")
-                if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
-                    self.get_logger().error("[Returning] Planning failed")
-                    return result
-                result["trajectories"]["returning"] = result_msg.result.planned_trajectory
+                    send_timeout=15.0, result_timeout=t + 15.0, label="[Returning]")
+                if result_msg is not None and result_msg.result.error_code.val == MoveItErrorCodes.SUCCESS:
+                    return_traj = result_msg.result.planned_trajectory
+                    self.get_logger().info(f"[Returning] {planner} succeeded")
+                    break
+                err = result_msg.result.error_code.val if result_msg else "no response"
+                self.get_logger().warn(f"[Returning] {planner} failed: {_MOVEIT_ERROR_NAMES.get(err, err)}")
+
+            if return_traj is None:
+                self.get_logger().error("[Returning] All planners failed")
+                return result
+            result["trajectories"]["returning"] = return_traj
 
             if not self.execute_trajectory(result["trajectories"]["returning"]):
                 self.get_logger().error("[Returning] Execution failed")
@@ -1445,16 +1685,16 @@ def _execute_grasp_core(
 
     home_joints = home_config.get("joints", [0.0] * 7)
 
-    # 容差: 传入 > config > 默认值
-    _pos_tol = pos_tol if pos_tol is not None else grasp_cfg.get("pos_tol", 0.01)
-    _ori_tol = ori_tol if ori_tol is not None else grasp_cfg.get("ori_tol", 0.01)
+    # 容差: 传入 > 默认值
+    _pos_tol = pos_tol if pos_tol is not None else 0.005
+    _ori_tol = ori_tol if ori_tol is not None else 0.05
 
     try:
         if executor.execution_mode:
             goal = executor.build_joint_goal(
                 joint_positions=home_joints,
                 drive_joint_rad=executor.gripper_joint_max,
-                allowed_time=30.0, planner_id="RRTstart"
+                allowed_time=5.0, planner_id="RRTConnect"
             )
             result_msg = executor._send_action_goal(
                 executor.move_action_client, goal,
@@ -1509,7 +1749,6 @@ def _execute_grasp_core(
         ranked_results = executor.plan_rank_all_candidates(
             all_candidates,
             grasp_pose=grasp_pose_base,
-            planner_id="RRTstart",
             start_joint_state=executor.current_joint_state,
             start_xyz=start_xyz,
             pos_tol=_pos_tol, ori_tol=_ori_tol
