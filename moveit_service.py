@@ -28,7 +28,7 @@ _result_queue: queue.Queue = None
 _ros_exec: MultiThreadedExecutor = None
 _worker_thread: threading.Thread = None
 _current_robot: str = None
-_execution_mode: bool = False
+_execution_mode: bool = True
 _init_lock = threading.Lock()
 
 
@@ -122,7 +122,7 @@ def _run_grasp(node, params):
 
     original_mode = node.execution_mode
     if plan_only:
-        node.execution_mode = False
+        node.execution_mode = True
     try:
         results = _execute_grasp_core(
             executor=node,
@@ -514,7 +514,7 @@ def forward():
             "seg_json_path": tmp_seg.name,
             "affordance_path": tmp_aff.name,
             "target_object_index": target_object_index,
-            "plan_only": True,
+            "plan_only": False,
             "return_trajectories": True,
         }, timeout=1800)
 
@@ -542,7 +542,7 @@ def forward():
 #  Entry point
 # ---------------------------------------------------------------------------
 
-def start_service(host="0.0.0.0", port=8000, robot_name="xarm7", execution_mode=False):
+def start_service(host="0.0.0.0", port=8000, robot_name="xarm7", execution_mode=True):
     init_ros_service(robot_name=robot_name, execution_mode=execution_mode)
 
     actual_port = port

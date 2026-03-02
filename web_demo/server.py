@@ -20,13 +20,16 @@ def index():
 @app.route('/predict/')
 def predict():
     # input:
+    #   robot_name: str
     #   rgb, optional
     #   dpt
     #   objs: each obj has attribute: [mask, affordance, bbox, score]
     #   start_pos: pose of end-effector, (x-m, y-m, z-m, roll-rad, pitch-rad, yaw-rad)
     #   end_pos: pose of end-effector aftering picking:  (x-m, y-m, z-m, roll-rad, pitch-rad, yaw-rad)
+    #   target_pos:position of target basket
     #   excution_simulation: bool
-    #
+    #   camera:intrinsic matrix and extrinsic matrix
+    
     # find the best picking candidate in the objs, and return the best one (index)
     # steps:
         # - destory scene
