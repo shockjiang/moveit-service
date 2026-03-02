@@ -22,6 +22,7 @@ docker:
 		-v /data1/comp_robot:/comp_robot \
 		-v /data1/vePFS:/vePFS \
 		-w /workspace/moveit-service \
+		-p 14086:14086 -p 14087:14087 \
 		-e ROS_DOMAIN_ID=10 \
 		${DOCKER_IMAGE} \
 		bash -c "/bin/bash"
@@ -100,11 +101,31 @@ service:
 	source set-env.sh
 	/usr/bin/python3 moveit_service.py
 
+
 client:
 	source set-env.sh
 	/usr/bin/python3 grasp_client.py --target 3
 
+	#/usr/bin/python3 ./tests/test_client.py
+	#/usr/bin/python3 web_demo/moveit_server.py --test
+	#/usr/bin/python3 grasp_client.py --target 3
+
+
+service2:
+	source set-env.sh
+	/usr/bin/python3 web_demo/moveit_server.py
+
+client2:
+	source set-env.sh
+	/usr/bin/python3 web_demo/client.py --dpt test_data/grasp-wrist-dpt_opt.png \
+		--objs test_data/affordance.json \
+		--seg test_data/rgb_detection_wrist.json
 # 	xvfb-run ros2 launch xarm7_moveit_config xarm7_sim_planning.launch.py use_rviz:=false 2 > log/moveit.log & tail -f log/moveit.log
+
+test2:
+	source set-env.sh	
+	/usr/bin/python3 web_demo/moveit_server.py --test
+
 
 run-vis:
 	source set-env.sh

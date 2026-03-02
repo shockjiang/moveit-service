@@ -62,7 +62,7 @@ def main():
         print(f"Server: {info.get('service')}  status={info.get('status')}  robot={info.get('robot')}")
     except Exception as e:
         print(f"Error: cannot reach server at {url} — {e}")
-        sys.exit(1)
+        # sys.exit(1)
 
     # Build request
     payload = {

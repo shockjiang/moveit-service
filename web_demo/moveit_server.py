@@ -227,7 +227,13 @@ if __name__ == "__main__":
     _init(a.robot, a.execution_mode)
 
     if a.test:
-        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_data")
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../test_data")
+        if not os.path.isdir(d):
+            d2 = os.path.join(d, '../../test_data/')
+            if not os.path.isdir(d2):
+                print(f'{d} {d2} not exists')
+            else:
+                d = d2
         P = {k: os.path.join(d, v) for k, v in [
             ("dpt","grasp-wrist-dpt_opt.png"),("objs","affordance.json"),("seg","rgb_detection_wrist.json")]}
         for p in P.values():

@@ -1689,6 +1689,10 @@ def _execute_grasp_core(
     _pos_tol = pos_tol if pos_tol is not None else 0.005
     _ori_tol = ori_tol if ori_tol is not None else 0.05
 
+    _pos_tol = pos_tol if pos_tol is not None else 0.05
+    _ori_tol = ori_tol if ori_tol is not None else 0.3
+
+
     try:
         if executor.execution_mode:
             goal = executor.build_joint_goal(

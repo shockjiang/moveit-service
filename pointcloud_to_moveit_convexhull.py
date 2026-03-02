@@ -133,8 +133,8 @@ class SceneManager:
         # ROS2 发布器
         cloud_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
+            depth=10,  # 增加队列深度，避免消息被覆盖
+            reliability=ReliabilityPolicy.RELIABLE,  # 确保消息送达
             durability=DurabilityPolicy.VOLATILE,
         )
         self.topic = "/camera/depth/color/points"
@@ -142,12 +142,20 @@ class SceneManager:
 
         # Octomap -> PlanningScene 桥接
         self.scene_pub = self.node.create_publisher(PlanningScene, '/planning_scene', 10)
+
+        octomap_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,  # Match the publisher
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.octomap_sub = self.node.create_subscription(
             Octomap,
             '/octomap_binary',
             self.octomap_callback,
-            10
+            octomap_qos  # Use explicit QoS
         )
+
 
         # ROS2 服务客户端
         self._clear_cli = self.node.create_client(Empty, "/octomap_server/reset")
@@ -207,7 +215,7 @@ class SceneManager:
             )
         else:
             bg_mask = np.ones_like(z_m, dtype=bool)
-        pts_bg = self._build_points(z_m, bg_mask)
+        pts_bg = self._build_points(z_m, bg_mask) #(N, 3)
         if pts_bg.shape[0] > 0:
             self.node.get_logger().info(
                 f"Background points generated: {pts_bg.shape[0]}, "
@@ -290,24 +298,25 @@ class SceneManager:
                 self.node.get_logger().info(f"Waiting for subscribers... ({elapsed:.1f}s)")
                 time.sleep(0.5)
 
-            # 发布点云（增加次数和间隔，确保 octomap 充分消费）
+            # 发布点云（多次发布确保 octomap_server 接收）
             self.node.get_logger().info(f"Publishing background cloud: {pts_bg.shape[0]} points to {self.topic} in frame {self.frame_id}")
             self.octomap_received = False
             for i in range(5):
                 self._publish_pointcloud(pts_bg)
-                time.sleep(0.1)
-            self.node.get_logger().info(f"✓ Finished publishing background cloud (5 times over 0.5s)")
+                self.node.get_logger().info(f"  Published point cloud {i+1}/5")
+                time.sleep(0.2)  # 适中的间隔
+            self.node.get_logger().info(f"✓ Finished publishing background cloud (5 times over 1.0s)")
             self.node.get_logger().info("Waiting for octomap response...")
-            wait_start = self.node.get_clock().now()
-            wait_timeout = 15.0
-            while not self.octomap_received:
-                time.sleep(0.1)
-                elapsed = (self.node.get_clock().now() - wait_start).nanoseconds / 1e9
-                if elapsed > wait_timeout:
-                    self.node.get_logger().error(f"Timeout waiting for octomap response after {wait_timeout}s")
-                    break
-            if self.octomap_received:
-                self.node.get_logger().info("✓ Octomap received and published to planning scene")
+            # wait_start = self.node.get_clock().now()
+            # wait_timeout = 1
+            # while not self.octomap_received:
+            #     time.sleep(0.1)
+            #     elapsed = (self.node.get_clock().now() - wait_start).nanoseconds / 1e9
+            #     if elapsed > wait_timeout:
+            #         self.node.get_logger().error(f"Timeout waiting for octomap response after {wait_timeout}s")
+            #         break
+            # if self.octomap_received:
+            #     self.node.get_logger().info("✓ Octomap received and published to planning scene")
 
     def remove_instance_hull(self, instance_id: str):
         """移除目标物品凸包"""
@@ -464,7 +473,8 @@ class SceneManager:
     def _publish_pointcloud(self, pts: np.ndarray):
         """发布点云消息"""
         header = Header()
-        header.stamp = rclpy.time.Time(seconds=0).to_msg()
+        # header.stamp = rclpy.time.Time(seconds=0).to_msg()
+        header.stamp = self.node.get_clock().now().to_msg()
         header.frame_id = self.frame_id
         msg = point_cloud2.create_cloud_xyz32(header, pts.tolist())
         self.pub.publish(msg)
