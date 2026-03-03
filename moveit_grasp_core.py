@@ -285,6 +285,24 @@ class GraspExecutor(Node):
 
         self.get_logger().info(f"[Workspace] Added 6 walls")
 
+    def remove_workspace_walls(self):
+        """移除 add_workspace_walls 添加的 6 面碰撞墙壁"""
+        wall_ids = [
+            "ws_wall_x_pos", "ws_wall_x_neg",
+            "ws_wall_y_pos", "ws_wall_y_neg",
+            "ws_wall_z_pos", "ws_wall_z_neg",
+        ]
+        ps = PlanningScene()
+        ps.is_diff = True
+        for wid in wall_ids:
+            co = CollisionObject()
+            co.id = wid
+            co.header.frame_id = self.base_frame
+            co.operation = CollisionObject.REMOVE
+            ps.world.collision_objects.append(co)
+        self.scene_pub.publish(ps)
+        self.get_logger().info("[Workspace] Removed 6 walls")
+
     def add_open_top_basket_to_scene(
         self,
         object_id: str,
@@ -1312,11 +1330,17 @@ class GraspExecutor(Node):
         fast_filter_time: float = 5.0,
         refine_time: float = 15.0,
         top_n: int = 1,
-        score_weight: float = 0.3
+        score_weight: float = 0.3,
+        basket: Optional[Dict[str, Any]] = None,
+        place_clearance: float = 0.05,
+        carry_filter_k: int = 3,
+        carry_filter_time: float = 3.0,
+        gripper_close_tightness: float = 0.02
     ) -> List[Dict[str, Any]]:
-        """两阶段规划：
-        Phase 1 - RRTConnect 只规划 pregrasp，快速筛选全部候选
-        Phase 2 - 对 top-N 补充 grasp 规划 + RDP shortcutting 后处理
+        """三阶段规划：
+        Phase 1   - RRTConnect 只规划 pregrasp，快速筛选全部候选
+        Phase 1.5 - 对 top-K 检查 carry 可行性（需 basket 参数）
+        Phase 2   - 对 carry 可行的候选补充 grasp 规划 + RDP shortcutting
         """
         t0 = time.perf_counter()
 
@@ -1370,7 +1394,105 @@ class GraspExecutor(Node):
             return r['cost'] - score_weight * r.get('score', 0.0)
 
         feasible.sort(key=_rank_key)
-        to_refine = feasible[:top_n]
+
+        # ── Phase 1.5: carry 可行性快筛（top-K）──
+        if basket is not None:
+            basket_rim_z = basket["center"][2] + basket["size"][2] / 2
+            place_z = basket_rim_z + place_clearance
+            carry_xyz = [float(basket["center"][0]),
+                         float(basket["center"][1]),
+                         float(place_z)]
+
+            k = min(carry_filter_k, len(feasible))
+            carry_candidates = feasible[:k]
+            self.get_logger().info(
+                f"[Phase1.5] Carry feasibility check for top-{k} candidates "
+                f"(target={carry_xyz}, timeout={carry_filter_time}s)")
+
+            carry_feasible = []
+            for fast_r in carry_candidates:
+                cand_id = fast_r.get("id", "?")
+                instance_id = fast_r.get("instance_id", "")
+                pregrasp_end_state = fast_r.get("pregrasp_end_state")
+                if pregrasp_end_state is None:
+                    self.get_logger().warn(
+                        f"[Phase1.5] No pregrasp_end_state for {cand_id}, skip carry check")
+                    carry_feasible.append(fast_r)  # 不确定则保留
+                    continue
+
+                # 计算 close_rad 和 carry_rpy
+                close_width = max(0.0, fast_r["gripper_width"] - gripper_close_tightness)
+                close_rad = close_width / self.gripper_width_max * self.gripper_joint_max
+                grasp_yaw = float(fast_r["adjusted_grasp_pose"][2])
+                carry_rpy = (-np.pi, 0.0, grasp_yaw)
+
+                # attach 物体到夹爪（用于碰撞检测）
+                attach_ok = self.attach_object_mesh(
+                    instance_id,
+                    tcp_xyz=fast_r["center"],
+                    tcp_rpy=fast_r["adjusted_grasp_pose"])
+                if attach_ok:
+                    self._spin_wait(0.5)
+
+                # 短超时 carry 规划
+                carry_goal = self.build_goal(
+                    xyz=carry_xyz, rpy=carry_rpy,
+                    drive_joint_rad=close_rad,
+                    start_joint_state=pregrasp_end_state,
+                    planner_id="RRTConnect",
+                    allowed_time=carry_filter_time,
+                    num_planning_attempts=2,
+                    pos_tol=0.05, ori_tol=0.3)
+                carry_result = self._send_action_goal(
+                    self.move_action_client, carry_goal,
+                    send_timeout=10.0,
+                    result_timeout=carry_filter_time + 10.0,
+                    label=f"[Phase1.5 carry {cand_id}]")
+
+                # detach 并恢复物体为场景碰撞体
+                self.detach_object()
+                if (instance_id and self.scene_manager
+                        and instance_id in self.scene_manager.processed_meshes):
+                    self.scene_manager._apply_collision_meshes(
+                        [(instance_id, self.scene_manager.processed_meshes[instance_id])])
+                self._spin_wait(0.2)
+
+                if (carry_result is not None and
+                        carry_result.result.error_code.val == MoveItErrorCodes.SUCCESS):
+                    carry_traj = carry_result.result.planned_trajectory
+                    carry_cost_info = self.trajectory_cost(carry_traj)
+                    fast_r['carry_cost'] = carry_cost_info['cost']
+                    fast_r['carry_trajectory'] = carry_traj
+                    carry_feasible.append(fast_r)
+                    self.get_logger().info(
+                        f"[Phase1.5] {cand_id} carry OK "
+                        f"(cost={carry_cost_info['cost']:.3f})")
+                else:
+                    err = (carry_result.result.error_code.val
+                           if carry_result else "no response")
+                    self.get_logger().warn(
+                        f"[Phase1.5] {cand_id} carry FAILED: "
+                        f"{_MOVEIT_ERROR_NAMES.get(err, err)}")
+
+            phase15_time = time.perf_counter() - t0 - phase1_time
+            self.get_logger().info(
+                f"[Phase1.5] {len(carry_feasible)}/{k} carry-feasible "
+                f"in {phase15_time:.2f}s")
+
+            if not carry_feasible:
+                self.get_logger().error(
+                    "[Phase1.5] All top-K carry checks failed, "
+                    "falling back to approach-only ranking")
+                carry_feasible = feasible[:top_n]
+
+            # 用 approach_cost + carry_cost 综合排序
+            def _combined_key(r):
+                return (r['cost'] + r.get('carry_cost', 0.0)
+                        - score_weight * r.get('score', 0.0))
+            carry_feasible.sort(key=_combined_key)
+            to_refine = carry_feasible
+        else:
+            to_refine = feasible[:top_n]
 
         # ── Phase 2: grasp 规划 + pregrasp shortcutting ──
         self.get_logger().info(
@@ -1452,10 +1574,14 @@ class GraspExecutor(Node):
 
         self._restore_last_removed(cur_removed)
 
-        # 追加 Phase 1 中未进入 Phase 2 的候选（仅有 pregrasp，作为备选信息）
+        # 清理内部字段，区分完整规划 vs 备选
+        attempted_ids = {r.get('id') for r in to_refine}
         refined_ids = {r.get('id') for r in results}
-        for r in feasible[top_n:]:
-            if r.get('id') not in refined_ids:
+
+        # 追加未进入 Phase 2 的候选（仅有 pregrasp，作为备选信息）
+        for r in feasible:
+            rid = r.get('id')
+            if rid not in refined_ids and rid not in attempted_ids:
                 r.pop('_aff', None)
                 results.append(r)
 
@@ -1467,7 +1593,13 @@ class GraspExecutor(Node):
             f"[Approaching] Planning complete: {len(results)}/{len(grasp_candidates)} succeeded "
             f"in {planning_time:.2f}s (phase1={phase1_time:.1f}s)")
 
-        results.sort(key=_rank_key)
+        # 完整规划的候选排在前面，备选排在后面
+        def _final_key(r):
+            has_grasp = 0 if "grasp_trajectory" in r else 1
+            combined = (r['cost'] + r.get('carry_cost', 0.0)
+                        - score_weight * r.get('score', 0.0))
+            return (has_grasp, combined)
+        results.sort(key=_final_key)
         return results
 
 
@@ -1634,38 +1766,52 @@ class GraspExecutor(Node):
 
             self.get_logger().info(f"[Carrying] target={carry_xyz}")
             self._spin_wait(0.8)
-            # self.remove_basket_from_scene(basket["id"])
 
+            # 优先复用 Phase 1.5 已验证的 carry 轨迹
+            # Phase 1.5 使用 pregrasp_end_state 规划，与 retreat 后的
+            # current_joint_state 可能不同（7DOF 冗余臂 IK 零空间差异），
+            # 直接重新规划可能因不同的关节构型而失败
+            preplan_carry = best_candidate.get("carry_trajectory")
             carry_result = None
-            for planner, t, attempts, p_tol, o_tol in [
-                ("RRTConnect", 15.0, 10, 0.05, 0.3),
-            ]:
-                self.get_logger().info(f"[Carrying] {planner} t={t}s pos={p_tol} ori={o_tol}")
-                carry_goal = self.build_goal(
-                    xyz=carry_xyz, rpy=carry_rpy, drive_joint_rad=close_rad,
-                    start_joint_state=current_joint_state,
-                    planner_id=planner, allowed_time=t,
-                    num_planning_attempts=attempts,
-                    pos_tol=p_tol, ori_tol=o_tol)
-                result_msg = self._send_action_goal(
-                    self.move_action_client, carry_goal,
-                    send_timeout=15.0, result_timeout=t + 15.0, label="[Carrying]")
-                if result_msg is not None and result_msg.result.error_code.val == MoveItErrorCodes.SUCCESS:
-                    carry_result = (result_msg.result.planned_trajectory,
-                                    self.extract_final_joint_state(result_msg.result.planned_trajectory))
-                    self.get_logger().info(f"[Carrying] {planner} succeeded")
-                    break
-                err = result_msg.result.error_code.val if result_msg else "no response"
 
-                self.get_logger().error(
-                    f"[Carrying] error_code={err} ({_MOVEIT_ERROR_NAMES.get(err, 'UNKNOWN')}), "
-                    f"start_joints={current_joint_state}, "
-                    f"target_xyz={carry_xyz}, "
-                    f"attached={list(self.attached_objects.keys())}, "
-                    f"place_z={place_z}, basket_rim_z={basket_rim_z}"
-    )
-                print(f"[Carrying] {planner} failed with error code: {err}")
-                self.get_logger().warn(f"[Carrying] {planner} failed: {_MOVEIT_ERROR_NAMES.get(err, err)}")
+            if preplan_carry is not None:
+                self.get_logger().info("[Carrying] Reusing Phase 1.5 pre-planned trajectory")
+                carry_traj = preplan_carry
+                carry_final = self.extract_final_joint_state(carry_traj)
+                if carry_final is not None:
+                    carry_result = (carry_traj, carry_final)
+                else:
+                    self.get_logger().warn(
+                        "[Carrying] Phase 1.5 trajectory has no final state, re-planning")
+
+            # 回退：从当前状态重新规划
+            if carry_result is None:
+                for planner, t, attempts, p_tol, o_tol in [
+                    ("RRTConnect", 15.0, 10, 0.05, 0.3),
+                ]:
+                    self.get_logger().info(f"[Carrying] {planner} t={t}s pos={p_tol} ori={o_tol}")
+                    carry_goal = self.build_goal(
+                        xyz=carry_xyz, rpy=carry_rpy, drive_joint_rad=close_rad,
+                        start_joint_state=current_joint_state,
+                        planner_id=planner, allowed_time=t,
+                        num_planning_attempts=attempts,
+                        pos_tol=p_tol, ori_tol=o_tol)
+                    result_msg = self._send_action_goal(
+                        self.move_action_client, carry_goal,
+                        send_timeout=15.0, result_timeout=t + 15.0, label="[Carrying]")
+                    if result_msg is not None and result_msg.result.error_code.val == MoveItErrorCodes.SUCCESS:
+                        carry_result = (result_msg.result.planned_trajectory,
+                                        self.extract_final_joint_state(result_msg.result.planned_trajectory))
+                        self.get_logger().info(f"[Carrying] {planner} succeeded")
+                        break
+                    err = result_msg.result.error_code.val if result_msg else "no response"
+                    self.get_logger().error(
+                        f"[Carrying] error_code={err} ({_MOVEIT_ERROR_NAMES.get(err, 'UNKNOWN')}), "
+                        f"start_joints={current_joint_state}, "
+                        f"target_xyz={carry_xyz}, "
+                        f"attached={list(self.attached_objects.keys())}, "
+                        f"place_z={place_z}, basket_rim_z={basket_rim_z}")
+                    self.get_logger().warn(f"[Carrying] {planner} failed: {_MOVEIT_ERROR_NAMES.get(err, err)}")
 
             if carry_result is None:
                 self.get_logger().error("[Carrying] All planners failed")
@@ -1972,20 +2118,24 @@ def _execute_grasp_core(
         grasp_pose_base = tuple(start_pos[3:]) if start_pos \
             else tuple(home_config.get("orientation", (-np.pi, 0.0, 0.0)))
         start_xyz = start_pos[:3] if start_pos else home_config.get("position", [0.27, 0.0, 0.307])
+        place_clearance = grasp_cfg.get("place_clearance", 0.05)
+        gripper_close_tightness = grasp_cfg.get("gripper_close_tightness", 0.02)
+
         ranked_results = executor.plan_rank_all_candidates(
             all_candidates,
             grasp_pose=grasp_pose_base,
             start_joint_state=executor.current_joint_state,
             start_xyz=start_xyz,
-            pos_tol=_pos_tol, ori_tol=_ori_tol
+            pos_tol=_pos_tol, ori_tol=_ori_tol,
+            basket=basket,
+            place_clearance=place_clearance,
+            gripper_close_tightness=gripper_close_tightness
         )
 
         if not ranked_results:
             executor.get_logger().error("All candidates failed planning")
             print(f"[DIAG] plan_rank_all_candidates returned 0 results (all {len(all_candidates)} candidates failed)")
             return results
-
-        place_clearance = grasp_cfg.get("place_clearance", 0.05)
 
         # 按 instance_id 去重，保留最优候选
         seen = set()
@@ -2045,6 +2195,7 @@ def _execute_grasp_core(
                 time.sleep(0.1)
                 executor.clear_pointcloud_obstacles()
                 executor.remove_basket_from_scene(basket["id"])
+                executor.remove_workspace_walls()
                 executor.clear_octomap()
                 time.sleep(0.2)
                 executor.get_logger().info("[Cleanup] Scene cleanup done")

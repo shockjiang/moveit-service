@@ -34,6 +34,7 @@ def _init(robot, exec_mode=False):
         try:
             _node.detach_object()
             _node.clear_pointcloud_obstacles()
+            _node.remove_workspace_walls()
             _node.clear_octomap()
             time.sleep(0.2)
             print("[Init] Scene cleanup done")
@@ -42,13 +43,14 @@ def _init(robot, exec_mode=False):
         print(f"[Init] Ready  robot={robot}  exec={exec_mode}")
 
 def _cleanup_scene(remove_basket=False):
-    """Detach objects, clear obstacles/octomap, optionally remove basket."""
-    _node.detach_object(); time.sleep(0.3)
+    """Detach objects, clear obstacles/octomap/walls, optionally remove basket."""
+    _node.detach_object(); time.sleep(0.1)
     _node.clear_pointcloud_obstacles()
     if remove_basket:
         try: _node.remove_basket_from_scene("basket_1")
         except Exception: pass
-    _node.clear_octomap(); time.sleep(0.5)
+    _node.remove_workspace_walls()
+    _node.clear_octomap(); time.sleep(0.2)
 
 def _safe_num(val, type_fn=float, default=None):
     """Convert val to number, returning default on failure."""

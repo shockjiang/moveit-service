@@ -278,6 +278,7 @@ def init_ros_service(robot_name, execution_mode=False):
         try:
             _node.detach_object()
             _node.clear_pointcloud_obstacles()
+            _node.remove_workspace_walls()
             _node.clear_octomap()
             time.sleep(0.2)
             print("[Init] Scene cleanup done")
@@ -384,11 +385,12 @@ def cleanup_scene():
     basket_id = data.get("basket_id", "basket_1")
 
     _node.detach_object()
-    time.sleep(0.3)
+    time.sleep(0.1)
     _node.clear_pointcloud_obstacles()
     _node.remove_basket_from_scene(basket_id)
+    _node.remove_workspace_walls()
     _node.clear_octomap()
-    time.sleep(0.5)
+    time.sleep(0.2)
     return jsonify({"success": True, "message": "Scene cleanup done"})
 
 
@@ -532,11 +534,12 @@ def forward():
         # --- cleanup scene ---
         try:
             _node.detach_object()
-            time.sleep(0.3)
+            time.sleep(0.1)
             _node.clear_pointcloud_obstacles()
             _node.remove_basket_from_scene("basket_1")
+            _node.remove_workspace_walls()
             _node.clear_octomap()
-            time.sleep(0.5)
+            time.sleep(0.2)
         except Exception:
             traceback.print_exc()
 
