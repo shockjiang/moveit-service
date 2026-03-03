@@ -231,7 +231,7 @@ class GraspExecutor(Node):
         z_min, z_max = ws["z"]
 
         t = 0.02
-        pad = 1.0  # 覆盖范围 padding，避免边角漏洞
+        pad = 0.05  # 覆盖范围 padding，避免边角漏洞
 
         walls = []
 
@@ -841,8 +841,20 @@ class GraspExecutor(Node):
             jt = trajectory.joint_trajectory
             if not jt.points:
                 return None
-            n = len(self.arm_joint_names)
-            return list(jt.points[-1].positions[:n])
+            
+            last_positions = jt.points[-1].positions
+            name_to_pos = dict(zip(jt.joint_names, last_positions))
+            
+            # 按 arm_joint_names 的顺序提取，忽略 drive_joint
+            result = []
+            for name in self.arm_joint_names:
+                if name not in name_to_pos:
+                    self.get_logger().error(
+                        f"[Extract] joint '{name}' not found in trajectory. "
+                        f"Available: {list(jt.joint_names)}")
+                    return None
+                result.append(name_to_pos[name])
+            return result
         except Exception as e:
             self.get_logger().error(f"Failed to extract joint state: {e}")
             return None
@@ -1371,6 +1383,7 @@ class GraspExecutor(Node):
             retreat_pose = Pose()
             retreat_pose.position = Point(x=float(pregrasp_center[0]), y=float(pregrasp_center[1]), z=float(pregrasp_center[2]))
             retreat_pose.orientation = Quaternion(x=float(grasp_quat[0]), y=float(grasp_quat[1]), z=float(grasp_quat[2]), w=float(grasp_quat[3]))
+            self._spin_wait(0.5) 
 
             retreat_result = self.plan_cartesian_path(
                 waypoints=[retreat_pose], start_joint_state=current_joint_state,
@@ -1380,7 +1393,7 @@ class GraspExecutor(Node):
             else:
                 self.get_logger().warn("[Retreat] Cartesian failed, falling back to sampling planner")
                 retreat_traj = None
-                for planner, t, attempts in [("RRTConnect", 10.0, 5), ("RRTConnect", 15.0, 5)]:
+                for planner, t, attempts in [("RRTConnect", 15.0, 5)]:
                     self.get_logger().info(f"[Retreat] Trying {planner} t={t}s")
                     goal = self.build_goal(
                         xyz=pregrasp_center, rpy=actual_rpy,
@@ -1388,7 +1401,7 @@ class GraspExecutor(Node):
                         start_joint_state=current_joint_state,
                         planner_id=planner, allowed_time=t,
                         num_planning_attempts=attempts,
-                        pos_tol=0.01, ori_tol=0.1)
+                        pos_tol=0.1, ori_tol=1.0)
                     result_msg = self._send_action_goal(
                         self.move_action_client, goal,
                         send_timeout=15.0, result_timeout=t + 15.0, label="[Retreat]")
@@ -1398,6 +1411,7 @@ class GraspExecutor(Node):
                         self.get_logger().info(f"[Retreat] {planner} succeeded")
                         break
                     err = result_msg.result.error_code.val if result_msg else "no response"
+                    print(f"[Retreat] {planner} failed with error code: {err}")
                     self.get_logger().warn(f"[Retreat] {planner} failed: {_MOVEIT_ERROR_NAMES.get(err, err)}")
                 if retreat_traj is None:
                     self.get_logger().error("[Retreat] All planners failed")
@@ -1418,11 +1432,12 @@ class GraspExecutor(Node):
             carry_rpy = (-np.pi, 0.0, 0.0)
 
             self.get_logger().info(f"[Carrying] target={carry_xyz}")
+            self._spin_wait(0.5) 
+            # self.remove_basket_from_scene(basket["id"])
 
             carry_result = None
             for planner, t, attempts, p_tol, o_tol in [
-                ("RRTConnect", 10.0, 5, 0.01, 0.1),
-                ("RRTConnect", 15.0, 5, 0.05, 0.3),
+                ("RRTConnect", 15.0, 10, 0.1, 1.5),
             ]:
                 self.get_logger().info(f"[Carrying] {planner} t={t}s pos={p_tol} ori={o_tol}")
                 carry_goal = self.build_goal(
@@ -1440,6 +1455,15 @@ class GraspExecutor(Node):
                     self.get_logger().info(f"[Carrying] {planner} succeeded")
                     break
                 err = result_msg.result.error_code.val if result_msg else "no response"
+
+                self.get_logger().error(
+                    f"[Carrying] error_code={err} ({_MOVEIT_ERROR_NAMES.get(err, 'UNKNOWN')}), "
+                    f"start_joints={current_joint_state}, "
+                    f"target_xyz={carry_xyz}, "
+                    f"attached={list(self.attached_objects.keys())}, "
+                    f"place_z={place_z}, basket_rim_z={basket_rim_z}"
+    )
+                print(f"[Carrying] {planner} failed with error code: {err}")
                 self.get_logger().warn(f"[Carrying] {planner} failed: {_MOVEIT_ERROR_NAMES.get(err, err)}")
 
             if carry_result is None:

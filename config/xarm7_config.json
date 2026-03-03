@@ -45,15 +45,15 @@
     },
     
     "workspace_limits": {
-        "x": [-0.25, 0.7],
+        "x": [-0.25, 0.78],
         "y": [-0.65, 0.65],
         "z": [-0.1, 0.8]
     },
     
     "basket": {
         "default_id": "basket_1",
-        "center": [0.4, -0.4, 0.157],
-        "outer_size": [0.3, 0.2, 0.15],
+        "center": [0.35, -0.4, 0.05],
+        "outer_size": [0.3, 0.2, 0.1],
         "wall_thickness": 0.005,
         "bottom_thickness": 0.005,
         "rpy": [0.0, 0.0, 0.0]

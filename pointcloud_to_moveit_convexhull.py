@@ -162,38 +162,48 @@ class SceneManager:
         self._apply_scene_cli = self.node.create_client(ApplyPlanningScene, "/apply_planning_scene")
 
     def update_scene(self, depth_path: str, seg_json_path: str):
+        stage_start = time.time()
+        total_start = time.time()
+
         # 1. 清除OctoMap（同步等待完成）
         if self._clear_cli.wait_for_service(timeout_sec=2.0):
             try:
                 future = self._clear_cli.call_async(Empty.Request())
-                # 等待 clear 完成（node 已由 executor spin，不再手动 spin_once）
-                timeout_sec = 5.0
-                start = self.node.get_clock().now()
-                while not future.done():
-                    time.sleep(0.1)
-                    elapsed = (self.node.get_clock().now() - start).nanoseconds / 1e9
-                    if elapsed > timeout_sec:
-                        self.node.get_logger().warn("Timeout waiting for /clear_octomap to complete")
-                        break
-                self.node.get_logger().info("✓ OctoMap cleared")
+                rclpy.spin_until_future_complete(self.node, future, timeout_sec=5.0)
+                if future.done():
+                    self.node.get_logger().info("✓ OctoMap cleared")
+                else:
+                    self.node.get_logger().warn("Timeout waiting for /clear_octomap to complete")
             except Exception as e:
                 self.node.get_logger().error(f"Failed to clear OctoMap: {e}")
         else:
             self.node.get_logger().warn("/clear_octomap service not available")
 
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 1 - Clear OctoMap: {elapsed:.3f}s")
+
         # 2. 加载分割实例
+        stage_start = time.time()
         self.instances = self._load_instances(seg_json_path, self.score_thresh)
         if not self.instances:
             self.node.get_logger().warn("No instances loaded from segmentation")
 
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 2 - Load instances: {elapsed:.3f}s ({len(self.instances)} instances)")
+
         # 3. 读取深度图
+        stage_start = time.time()
         depth_img = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
         if depth_img is None:
             self.node.get_logger().error(f"Failed to read depth image: {depth_path}")
             return
         z_m = depth_img.astype(np.float32) * self.depth_scale
 
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 3 - Read depth image: {elapsed:.3f}s")
+
         # 4. 解码所有mask
+        stage_start = time.time()
         full_masks: list[np.ndarray] = []
         inst_ids: list[str] = []
         for inst in self.instances:
@@ -201,7 +211,11 @@ class SceneManager:
             full_masks.append(m)
             inst_ids.append(inst["id"])
 
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 4 - Decode masks: {elapsed:.3f}s ({len(full_masks)} masks)")
+
         # 5. 构建背景点云mask（膨胀物体mask，排除凸包边缘区域）
+        stage_start = time.time()
         if full_masks:
             union_mask = np.logical_or.reduce(full_masks)
             dilate_kernel = np.ones((15, 15), np.uint8)
@@ -215,7 +229,30 @@ class SceneManager:
             )
         else:
             bg_mask = np.ones_like(z_m, dtype=bool)
+
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 5 - Build background mask: {elapsed:.3f}s")
+
+        # 6. 构建背景点云
+        stage_start = time.time()
         pts_bg = self._build_points(z_m, bg_mask) #(N, 3)
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 6 - Build background points: {elapsed:.3f}s ({pts_bg.shape[0]} points)")
+
+        # 7. 采样背景点云
+        stage_start = time.time()
+        if pts_bg.shape[0] < 10000:
+            pass
+        else:
+            sample_size = max(1, pts_bg.shape[0] // 10)
+            if sample_size > 40000:
+                sample_size = 40000
+            indices = np.random.choice(pts_bg.shape[0], sample_size, replace=False)
+            pts_bg = pts_bg[indices]
+
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 7 - Sample background points: {elapsed:.3f}s (final: {pts_bg.shape[0]} points)")
+
         if pts_bg.shape[0] > 0:
             self.node.get_logger().info(
                 f"Background points generated: {pts_bg.shape[0]}, "
@@ -223,7 +260,8 @@ class SceneManager:
         else:
             self.node.get_logger().info(f"Background points generated: 0")
 
-        # 6. 估计背景z
+        # 8. 估计背景z
+        stage_start = time.time()
         base_z = 0.015
         try:
             base_z = self._estimate_base_z_from_bg(pts_bg)
@@ -235,7 +273,11 @@ class SceneManager:
         else:
             table_filter_margin = None
 
-        # 7. 先为每个启用的实例生成凸包（适当腐蚀避免邻居重叠）
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 8 - Estimate base z: {elapsed:.3f}s (base_z={base_z})")
+
+        # 9. 先为每个启用的实例生成凸包（适当腐蚀避免邻居重叠）
+        stage_start = time.time()
         k = 7 if self.stride <= 2 else 5
         kernel = np.ones((k, k), np.uint8)
 
@@ -266,7 +308,11 @@ class SceneManager:
             self.processed_meshes[inst_id] = mesh
             self.node.get_logger().info(f"[SUCCESS] {inst_id}: mesh created with {len(mesh.vertices)} vertices")
 
-        # 8. Apply 碰撞场景（凸包先上场景）
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 9 - Generate convex hulls: {elapsed:.3f}s ({len(meshes)} meshes)")
+
+        # 10. Apply 碰撞场景（凸包先上场景）
+        stage_start = time.time()
         if meshes:
             if not self._apply_scene_cli.wait_for_service(timeout_sec=2.0):
                 self.node.get_logger().warn("/apply_planning_scene not ready")
@@ -274,10 +320,14 @@ class SceneManager:
                 self._apply_collision_meshes(meshes)
                 self.node.get_logger().info(f"Applied {len(meshes)} collision meshes")
 
-        # 9. 发布背景点云给 OctoMap
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 10 - Apply collision meshes: {elapsed:.3f}s")
+
+        # 11. 发布背景点云给 OctoMap
+        stage_start = time.time()
         if pts_bg.shape[0] == 0:
             self.node.get_logger().warn("Background pointcloud is EMPTY! OctoMap will not update.")
-        else:
+        if 1:
             # 等待订阅者就绪
             self.node.get_logger().info(f"Waiting for OctoMap monitor to subscribe to {self.topic}...")
             timeout = 10.0  # 10秒超时
@@ -301,10 +351,12 @@ class SceneManager:
             # 发布点云（多次发布确保 octomap_server 接收）
             self.node.get_logger().info(f"Publishing background cloud: {pts_bg.shape[0]} points to {self.topic} in frame {self.frame_id}")
             self.octomap_received = False
-            for i in range(5):
-                self._publish_pointcloud(pts_bg)
-                self.node.get_logger().info(f"  Published point cloud {i+1}/5")
-                time.sleep(0.2)  # 适中的间隔
+            if 0:
+                for i in range(3):
+                    self._publish_pointcloud(pts_bg)
+                    self.node.get_logger().info(f"  Published point cloud {i+1}/3")
+                    time.sleep(0.2)  # 适中的间隔
+            self._publish_pointcloud(pts_bg)
             self.node.get_logger().info(f"✓ Finished publishing background cloud (5 times over 1.0s)")
             self.node.get_logger().info("Waiting for octomap response...")
             # wait_start = self.node.get_clock().now()
@@ -317,6 +369,13 @@ class SceneManager:
             #         break
             # if self.octomap_received:
             #     self.node.get_logger().info("✓ Octomap received and published to planning scene")
+
+        elapsed = time.time() - stage_start
+        self.node.get_logger().info(f"[TIMING] Stage 11 - Publish background cloud: {elapsed:.3f}s")
+
+        # Total timing
+        total_elapsed = time.time() - total_start
+        self.node.get_logger().info(f"[TIMING] ===== TOTAL update_scene: {total_elapsed:.3f}s =====")
 
     def remove_instance_hull(self, instance_id: str):
         """移除目标物品凸包"""
@@ -339,16 +398,21 @@ class SceneManager:
 
     def octomap_callback(self, octomap_msg):
         """接收octomap并转发到planning scene"""
+        callback_start = time.time()
+
         self.node.get_logger().info(f'Received octomap: {len(octomap_msg.data)} bytes')
 
         scene = PlanningScene()
-        scene.is_diff = True
+        scene.is_diff = True # can only be True, otherwise existing collision objects will be removed
         scene.world.octomap.header = octomap_msg.header
         scene.world.octomap.octomap = octomap_msg
 
         self.scene_pub.publish(scene)
         self.octomap_received = True
+
+        elapsed = time.time() - callback_start
         self.node.get_logger().info('Published octomap to planning scene')
+        self.node.get_logger().info(f'[TIMING] octomap_callback: {elapsed:.3f}s')
 
     def _load_instances(self, seg_json_path: str, score_thresh: float):
         """加载分割结果JSON"""
