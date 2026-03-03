@@ -1024,7 +1024,7 @@ class GraspExecutor(Node):
             "gripper_width": float(gripper_width),
             "drive_joint_rad": float(drive_joint_rad),
             "center": center,
-            "angle": aff.get("angle", 0.0),
+            "angle": yaw,
             "boundingbox": [
                 float(aff["boundingbox"].get("length", 0.05)),
                 float(aff["boundingbox"]["width"]),
@@ -1401,7 +1401,7 @@ class GraspExecutor(Node):
                         start_joint_state=current_joint_state,
                         planner_id=planner, allowed_time=t,
                         num_planning_attempts=attempts,
-                        pos_tol=0.1, ori_tol=1.0)
+                        pos_tol=0.05, ori_tol=0.5)
                     result_msg = self._send_action_goal(
                         self.move_action_client, goal,
                         send_timeout=15.0, result_timeout=t + 15.0, label="[Retreat]")
@@ -1432,12 +1432,12 @@ class GraspExecutor(Node):
             carry_rpy = (-np.pi, 0.0, 0.0)
 
             self.get_logger().info(f"[Carrying] target={carry_xyz}")
-            self._spin_wait(0.5) 
+            self._spin_wait(0.8) 
             # self.remove_basket_from_scene(basket["id"])
 
             carry_result = None
             for planner, t, attempts, p_tol, o_tol in [
-                ("RRTConnect", 15.0, 10, 0.1, 1.5),
+                ("RRTConnect", 15.0, 10, 0.05, 1.0),
             ]:
                 self.get_logger().info(f"[Carrying] {planner} t={t}s pos={p_tol} ori={o_tol}")
                 carry_goal = self.build_goal(
@@ -1502,8 +1502,7 @@ class GraspExecutor(Node):
 
             return_traj = None
             for planner, t, attempts, tol_scale in [
-                ("RRTConnect", 10.0, 5, 1.0),
-                ("RRTConnect", 15.0, 5, 1.5),
+                ("RRTConnect", 15.0, 5, 1.0),
             ]:
                 self.get_logger().info(f"[Returning] Trying {planner} (time={t}s)")
                 return_goal = build_fn(planner, t, attempts,
@@ -1713,8 +1712,8 @@ def _execute_grasp_core(
     _pos_tol = pos_tol if pos_tol is not None else 0.005
     _ori_tol = ori_tol if ori_tol is not None else 0.05
 
-    _pos_tol = pos_tol if pos_tol is not None else 0.05
-    _ori_tol = ori_tol if ori_tol is not None else 0.3
+    _pos_tol = pos_tol if pos_tol is not None else 0.01
+    _ori_tol = ori_tol if ori_tol is not None else 0.1
 
 
     try:
