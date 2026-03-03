@@ -30,6 +30,15 @@ def _init(robot, exec_mode=False):
         ex = MultiThreadedExecutor(num_threads=4); ex.add_node(_node)
         threading.Thread(target=ex.spin, daemon=True).start()
         _robot = robot; time.sleep(2.0)
+        # 启动时清空残留场景状态
+        try:
+            _node.detach_object()
+            _node.clear_pointcloud_obstacles()
+            _node.clear_octomap()
+            time.sleep(0.2)
+            print("[Init] Scene cleanup done")
+        except Exception as e:
+            print(f"[Init] Scene cleanup warning: {e}")
         print(f"[Init] Ready  robot={robot}  exec={exec_mode}")
 
 def _cleanup_scene(remove_basket=False):

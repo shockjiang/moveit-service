@@ -273,6 +273,17 @@ def init_ros_service(robot_name, execution_mode=False):
 
         _current_robot = robot_name
         time.sleep(2.0)
+
+        # 启动时清空残留场景状态
+        try:
+            _node.detach_object()
+            _node.clear_pointcloud_obstacles()
+            _node.clear_octomap()
+            time.sleep(0.2)
+            print("[Init] Scene cleanup done")
+        except Exception as e:
+            print(f"[Init] Scene cleanup warning: {e}")
+
         print(f"[Init] ROS service ready (robot={robot_name}, execution_mode={execution_mode})")
 
 
