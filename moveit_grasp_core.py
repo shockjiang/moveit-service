@@ -2031,6 +2031,11 @@ def _execute_grasp_core(
     参数优先级：直接传入 > config 字典 > 默认值
     """
     results = []
+    log = executor.get_logger()
+
+    # Timing for each stage
+    stage_start = time.perf_counter()
+    total_start = stage_start
 
     home_config = config.get("home", {})
     basket_cfg = config.get("basket", {})
@@ -2060,6 +2065,10 @@ def _execute_grasp_core(
     _pos_tol = pos_tol if pos_tol is not None else 0.01
     _ori_tol = ori_tol if ori_tol is not None else 0.1
 
+    stage_time = time.perf_counter() - stage_start
+    log.info(f"[Stage 1/9] Configuration setup completed in {stage_time:.3f}s")
+    stage_start = time.perf_counter()
+
 
     try:
         if executor.execution_mode:
@@ -2074,14 +2083,25 @@ def _execute_grasp_core(
             if result_msg is None or result_msg.result.error_code.val != MoveItErrorCodes.SUCCESS:
                 executor.get_logger().error("[HOME] Planning failed")
                 return results
+            else:
+                log.info(f'[HOME] plan succeed')
             if not executor.execute_trajectory(result_msg.result.planned_trajectory, timeout_sec=30.0):
                 executor.get_logger().error("[HOME] Execution failed")
                 return results
-
+            else:
+                log.info('[HOME] execution succeed')
         executor.current_joint_state = home_joints
+
+        stage_time = time.perf_counter() - stage_start
+        log.info(f"[Stage 2/9] Move to home position completed in {stage_time:.3f}s")
+        stage_start = time.perf_counter()
 
         with open(affordance_path, 'r', encoding='utf-8') as f:
             affordance_data = json.load(f)
+
+        stage_time = time.perf_counter() - stage_start
+        log.info(f"[Stage 3/9] Load affordance data completed in {stage_time:.3f}s")
+        stage_start = time.perf_counter()
 
         if executor.scene_manager is None:
             raise RuntimeError("Scene manager failed to initialize")
@@ -2100,6 +2120,10 @@ def _execute_grasp_core(
         )
         time.sleep(0.2)
 
+        stage_time = time.perf_counter() - stage_start
+        log.info(f"[Stage 4/9] Scene setup (walls + basket) completed in {stage_time:.3f}s")
+        stage_start = time.perf_counter()
+
         all_candidates = executor.parse_affordances_to_candidates(
             affordance_data, depth_path, seg_json_path,
             target_object_index=target_object_index,
@@ -2113,6 +2137,10 @@ def _execute_grasp_core(
             return results
 
         print(f"[DIAG] {len(all_candidates)} candidates generated for obj_index={target_object_index}")
+
+        stage_time = time.perf_counter() - stage_start
+        log.info(f"[Stage 5/9] Parse candidates ({len(all_candidates)} found) completed in {stage_time:.3f}s")
+        stage_start = time.perf_counter()
 
         # grasp_pose_base: 传入 > config > default
         grasp_pose_base = tuple(start_pos[3:]) if start_pos \
@@ -2137,6 +2165,10 @@ def _execute_grasp_core(
             print(f"[DIAG] plan_rank_all_candidates returned 0 results (all {len(all_candidates)} candidates failed)")
             return results
 
+        stage_time = time.perf_counter() - stage_start
+        log.info(f"[Stage 6/9] Plan and rank candidates ({len(ranked_results)} succeeded) completed in {stage_time:.3f}s")
+        stage_start = time.perf_counter()
+
         # 按 instance_id 去重，保留最优候选
         seen = set()
         unique_candidates = []
@@ -2144,6 +2176,10 @@ def _execute_grasp_core(
             if c["instance_id"] not in seen:
                 unique_candidates.append(c)
                 seen.add(c["instance_id"])
+
+        stage_time = time.perf_counter() - stage_start
+        log.info(f"[Stage 7/9] Deduplicate candidates ({len(unique_candidates)} unique) completed in {stage_time:.3f}s")
+        stage_start = time.perf_counter()
 
         best = unique_candidates[0]
         print(f"[DIAG] Best candidate: id={best.get('instance_id')}, "
@@ -2160,6 +2196,10 @@ def _execute_grasp_core(
         seq_time = time.perf_counter() - t0
         print(f"[DIAG] execute_complete_grasp_sequence: success={full_result.get('success')}, "
               f"time={seq_time:.2f}s, steps={len(full_result.get('trajectories', {}))}")
+
+        stage_time = time.perf_counter() - stage_start
+        log.info(f"[Stage 8/9] Execute best grasp sequence completed in {stage_time:.3f}s")
+        stage_start = time.perf_counter()
 
         trajs = full_result["trajectories"]
         result = {
@@ -2187,6 +2227,12 @@ def _execute_grasp_core(
             })
 
         executor.get_logger().info(f"Planning complete: {sum(r['success'] for r in results)}/{len(results)} succeeded")
+
+        stage_time = time.perf_counter() - stage_start
+        log.info(f"[Stage 9/9] Build results completed in {stage_time:.3f}s")
+
+        total_time = time.perf_counter() - total_start
+        log.info(f"[TOTAL] All stages completed in {total_time:.3f}s")
 
     finally:
         if not return_full_trajectories:
